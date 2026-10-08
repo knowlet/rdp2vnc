@@ -130,6 +130,7 @@ def main() -> None:
     assert client, "install freerdp3-x11"
     fixture = Fixture()
     processes: list[subprocess.Popen] = []
+    stalled: socket.socket | None = None
     with tempfile.TemporaryDirectory(prefix="rdp2vnc-e2e-") as temporary:
         root = Path(temporary)
         with socket.socket() as reservation:
@@ -147,6 +148,8 @@ def main() -> None:
                 ], env=env, stdout=output, stderr=subprocess.STDOUT)
             processes.append(gateway)
             until(lambda: "RDP ready" in gateway_log.read_text(), "gateway did not become ready")
+            # A peer that never sends even X.224 must not reserve the desktop.
+            stalled = socket.create_connection(("127.0.0.1", port), timeout=3)
             common = [client, f"/v:127.0.0.1:{port}", "/u:ci", "/cert:ignore", "/sec:nla",
                       "/size:640x480", "/bpp:32", "/gdi:sw", "/log-level:INFO"]
             wrong = subprocess.run(common + ["/p:fixture-only-wrong-password"], env=env,
@@ -161,7 +164,7 @@ def main() -> None:
                     viewer = subprocess.Popen(common + ["/p:fixture-only-good-password"], env=env,
                                               stdout=output, stderr=subprocess.STDOUT)
                 processes.append(viewer)
-                until(visible_frame, "RDP framebuffer did not match the VNC fixture")
+                until(visible_frame, "RDP framebuffer did not match the VNC fixture while an unauthenticated peer was idle", timeout=12)
                 assert viewer.poll() is None, "RDP client exited prematurely"
                 if attempt == 0:
                     ids = subprocess.check_output(["xdotool", "search", "--onlyvisible", "--pid", str(viewer.pid)], text=True).split()
@@ -173,6 +176,18 @@ def main() -> None:
                           "RDP key press/release did not reach VNC")
                     until(lambda: any(e[0] == "pointer" and e[1] & 1 for e in fixture.events),
                           "RDP mouse button did not reach VNC")
+                    # An unsuccessful contender's disconnect must not reset
+                    # keys held by the admitted client.
+                    subprocess.run(["xdotool", "keydown", "b"], check=True)
+                    until(lambda: ("key", 1, 98) in fixture.events, "held key did not reach VNC")
+                    checkpoint = len(fixture.events)
+                    assert stalled is not None
+                    stalled.close()
+                    stalled = None
+                    time.sleep(0.5)
+                    assert ("key", 0, 98) not in fixture.events[checkpoint:], "unauthenticated disconnect released the active client's key"
+                    subprocess.run(["xdotool", "keyup", "b"], check=True)
+                    until(lambda: ("key", 0, 98) in fixture.events[checkpoint:], "held key release did not reach VNC")
                     with socket.create_connection(("127.0.0.1", port), timeout=3) as extra:
                         extra.settimeout(3)
                         assert extra.recv(1) == b"", "second simultaneous RDP client was not rejected"
@@ -183,8 +198,10 @@ def main() -> None:
             assert gateway.returncode not in (0, 101), "backend disconnect should fail cleanly, not panic or succeed"
             assert "panicked at" not in gateway_log.read_text()
             assert not fixture.errors, fixture.errors
-            print("PASS: NLA rejection; authenticated pixels; keyboard/mouse; concurrent-client rejection; late-client snapshot; clean VNC EOF")
+            print("PASS: idle-peer admission; NLA rejection; authenticated pixels; keyboard/mouse; unsuccessful-peer input isolation; concurrent-client rejection; late-client snapshot; clean VNC EOF")
         finally:
+            if stalled is not None:
+                stalled.close()
             for process in reversed(processes):
                 stop(process)
             fixture.close()
