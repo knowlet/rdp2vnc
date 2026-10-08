@@ -102,7 +102,7 @@ rdp2vnc 127.0.0.1:5900 \
 
 Password files are **not** the encrypted `.vnc/passwd` format. On Unix, use mode 0600 or stricter; on Windows, restrict the file/directory ACL to your account. Environment variables can be inspected by sufficiently privileged processes; secret files or an interactive prompt are preferable. RDP passwords must contain at least 12 bytes. Non-interactive operation never generates a password into redirected logs.
 
-TLS identities are generated once per user, reused, and never overwritten silently. Generated keys use private permissions on Unix and the per-user application data directory on Windows. Generated certificates expire after one year; certificate rotation and Windows ACL policy are operator responsibilities. `SSLKEYLOGFILE` is deliberately not enabled. `RUST_LOG` is not honored, because upstream debug output may contain credentials; use `RDP2VNC_LOG=debug` for application-only diagnostics.
+TLS identities are generated once per user, reused, and never overwritten silently. New identities are staged privately and published as a complete pair under `tls/identity`; an interrupted first creation can safely retry. Existing legacy pairs remain in use. An incomplete existing identity requires restoring its missing file or explicitly supplying `--cert`/`--key`, so trusted fingerprints are never silently changed. Generated keys use private permissions on Unix and the per-user application data directory on Windows. Generated certificates expire after one year; certificate rotation and Windows ACL policy are operator responsibilities. `SSLKEYLOGFILE` is deliberately not enabled. `RUST_LOG` is not honored, because upstream debug output may contain credentials; use `RDP2VNC_LOG=debug` for application-only diagnostics.
 
 ## Useful options
 
@@ -120,7 +120,7 @@ Generated `.rdp` profiles require a trusted server identity (`authentication lev
 
 ## Implemented scope
 
-RDP TLS 1.2/1.3 plus NLA/CredSSP, independent gateway credentials, bounded authentication time, one active RDP client, and immediate rejection of extra clients. A reconnecting RDP client receives a complete framebuffer snapshot. A lost VNC connection closes the gateway cleanly instead of continuing to show a stale desktop.
+RDP TLS 1.2/1.3 plus NLA/CredSSP, independent gateway credentials, bounded authentication time, one active authenticated RDP client, up to eight pending handshakes, and immediate rejection of new clients while the desktop is occupied. A reconnecting RDP client receives a complete framebuffer snapshot. A lost VNC connection closes the gateway cleanly instead of continuing to show a stale desktop.
 
 RFB 3.3/3.7/3.8, Apple's 3.889 version banner, classic VNC authentication, ARD authentication, explicit None authentication on a protected/acknowledged transport, X509 VeNCrypt 0.2, and system OpenSSH forwarding. Encodings: Raw, CopyRect, Hextile, ZRLE; DesktopSize and LastRect pseudo-encodings. Bounded dimensions/lengths, full-width 4K updates, overlap-safe CopyRect, coalesced snapshots, keyboard/mouse, and UTF-16 to Unicode keysym translation.
 

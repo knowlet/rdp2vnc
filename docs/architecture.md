@@ -4,7 +4,7 @@
 
 `mstsc -> RDP/TLS/NLA listener -> framebuffer/input adapter -> RFB client -> VNC desktop`.
 
-RDP client credentials authenticate the gateway. VNC/ARD credentials authenticate the backend. A successful VNC login never grants unauthenticated RDP access. TLS-only and legacy RDP are not exposed by the CLI. A 30-second deadline covers RDP connection setup; subsequent sessions can remain open. Extra clients are immediately closed instead of accumulating an application queue.
+RDP client credentials authenticate the gateway. VNC/ARD credentials authenticate the backend. A successful VNC login never grants unauthenticated RDP access. TLS-only and legacy RDP are not exposed by the CLI. A 30-second deadline covers RDP connection setup; subsequent sessions can remain open. Up to eight unauthenticated connections can negotiate concurrently; only a successfully authenticated connection can claim the single desktop slot. New connections are closed while that slot is occupied or the handshake limit is reached. Input and display access are gated on admission, and failed contenders cannot reset the active client. These bounds do not replace firewall/rate-limit protection against distributed connection floods.
 
 The backend is connected before the RDP listener is opened. The whole initial VNC/SSH handshake has a 30-second deadline. DNS/TCP setup has an additional 10-second limit. Authentication failures terminate without downgrade retries. An explicit CA file requires X509 VeNCrypt, even on loopback or an SSH connection; it cannot be silently bypassed.
 
@@ -22,7 +22,7 @@ DesktopSize updates resize the backend framebuffer and precede corresponding RDP
 
 ## Limits and cancellation
 
-Frame: at most 8192 per dimension and 16,777,216 pixels. Text: bounded per message, at most 1 MiB clipboard discard. Compressed rectangle: 32 MiB; decompressed ZRLE has a rectangle-derived ceiling and a 128 MiB absolute cap. Rectangle count: 4096, including LastRect streams. Input queue: 256 events. Held keys: 256. A full input queue terminates the bridge rather than silently dropping a key-release.
+Frame: at most 8192 per dimension and 16,777,216 pixels. Text: bounded per message, at most 1 MiB clipboard discard. Compressed rectangle: 32 MiB; decompressed ZRLE has a rectangle-derived ceiling and a 128 MiB absolute cap. Rectangle count: 4096, including LastRect streams. Input queue: 256 events. Held keys: 256. Consecutive pointer motion is coalesced, and stale motion may be dropped under pressure. A full queue for key/button edges terminates the bridge rather than silently dropping a key-release.
 
 RFB parsing has a dedicated reader so asynchronous input events cannot cancel a partially read packet and desynchronize the stream. Writes have a 10-second operation timeout. No generic receive-idle timeout is imposed on static desktops. A peer that stalls midway through an update remains a resource-exhaustion consideration; this initial gateway is not intended for hostile public service deployment.
 
