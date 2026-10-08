@@ -108,18 +108,17 @@ mod tests {
 
     #[test]
     fn classic_vnc_known_des_vector() {
-        let password: Vec<u8> = [0x13u8, 0x34, 0x57, 0x79, 0x9b, 0xbc, 0xdf, 0xf1]
-            .iter()
-            .map(|v| v.reverse_bits())
-            .collect();
-        // DES known vector is tested directly; credential policy is tested separately.
-        let key: Vec<u8> = password.iter().map(|v| v.reverse_bits()).collect();
-        let cipher = des::Des::new_from_slice(&key).unwrap();
-        let mut block = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        cipher.encrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
-            &mut block,
-        ));
-        assert_eq!(block, [0x85, 0xe8, 0x13, 0x54, 0x0f, 0x0a, 0xb4, 0x05]);
+        // Independently generated with OpenSSL DES-ECB, using the VNC
+        // bit-reversed key 0e86ceceeef64e26 for ASCII "password". Exercise
+        // both challenge blocks through the actual protocol implementation.
+        let challenge = std::array::from_fn(|i| i as u8);
+        assert_eq!(
+            vnc_response(b"password", challenge).unwrap(),
+            [
+                0xb8, 0x66, 0x92, 0x41, 0x25, 0xc8, 0xee, 0xbb, 0x9d, 0xeb, 0xc1, 0xdb, 0x61, 0xc5,
+                0x38, 0xe2
+            ]
+        );
     }
 
     #[test]
