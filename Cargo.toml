@@ -18,7 +18,7 @@ des = { version = "0.8", features = ["zeroize"] }
 directories = "6"
 flate2 = "1"
 getrandom = "0.2"
-ironrdp-server = { version = "=0.13.0", default-features = false, features = ["helper"] }
+ironrdp-server = { git = "https://github.com/Devolutions/IronRDP", rev = "8e76c3168da578826d8fd707503655ea16bd3392", default-features = false, features = ["helper"] }
 md-5 = "0.10"
 num-bigint = "0.4"
 ratatui = "0.29"
