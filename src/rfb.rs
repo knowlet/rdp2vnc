@@ -280,23 +280,22 @@ impl Client {
             stream.write_u8(kind).await?;
             stream.flush().await?;
         }
-        let security;
-        if tls {
+        let security = if tls {
             (stream, _) = vencrypt(stream, &target.host, options).await?;
             result(&mut stream, version).await?;
-            security = "VeNCrypt X509/TLS";
+            "VeNCrypt X509/TLS"
         } else {
             do_auth(&mut stream, kind, options).await?;
             if kind != 1 || version >= 8 {
                 result(&mut stream, version).await?;
             }
             apple |= kind == 30;
-            security = if protected {
+            if protected {
                 "SSH/loopback"
             } else {
                 "UNENCRYPTED (explicit opt-in)"
-            };
-        }
+            }
+        };
         stream.write_u8(1).await?;
         stream.flush().await?; // Shared desktop, never exclusive.
         let width = stream.read_u16().await?;

@@ -23,7 +23,7 @@ pub fn vnc_response(password: &[u8], challenge: [u8; 16]) -> Result<[u8; 16]> {
     }
     let cipher = des::Des::new_from_slice(key.as_ref())?;
     let mut result = challenge;
-    for chunk in result.chunks_exact_mut(8) {
+    for chunk in result.as_chunks_mut::<8>().0 {
         cipher.encrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
             chunk,
         ));
@@ -91,7 +91,7 @@ pub fn ard_response(
     credentials[username.len()] = 0;
     credentials[64..64 + password.len()].copy_from_slice(password.as_bytes());
     credentials[64 + password.len()] = 0;
-    for block in credentials.chunks_exact_mut(16) {
+    for block in credentials.as_chunks_mut::<16>().0 {
         cipher.encrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
             block,
         ));
@@ -155,7 +155,7 @@ mod tests {
         let key = Md5::digest(padded(&shared, size).unwrap());
         let cipher = aes::Aes128::new_from_slice(&key).unwrap();
         let mut plain = response[..128].to_vec();
-        for b in plain.chunks_exact_mut(16) {
+        for b in plain.as_chunks_mut::<16>().0 {
             cipher.decrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(b));
         }
         assert_eq!(&plain[..7], b"albert\0");

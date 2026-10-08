@@ -69,7 +69,10 @@ impl Frame {
         self.check_rect(x, y, w, h)?;
         for row in y..y + h {
             let start = (usize::from(row) * usize::from(self.width) + usize::from(x)) * 4;
-            for p in self.pixels[start..start + usize::from(w) * 4].chunks_exact_mut(4) {
+            for p in self.pixels[start..start + usize::from(w) * 4]
+                .as_chunks_mut::<4>()
+                .0
+            {
                 p.copy_from_slice(&pixel);
             }
         }
@@ -95,7 +98,7 @@ mod tests {
     #[test]
     fn overlapping_copy_preserves_original_pixels() {
         let mut f = Frame::new(4, 4).unwrap();
-        for (i, p) in f.pixels.chunks_exact_mut(4).enumerate() {
+        for (i, p) in f.pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             p.fill(i as u8);
         }
         let old = f.clone();
