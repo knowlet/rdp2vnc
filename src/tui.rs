@@ -12,7 +12,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::{
     io::{self, IsTerminal},
@@ -39,6 +39,94 @@ pub struct Setup {
     pub rdp_password: Option<Zeroizing<String>>,
 }
 
+const LABELS: [&str; 7] = [
+    "VNC target",
+    "SSH user@host (optional)",
+    "VNC / Mac username (optional)",
+    "VNC password (hidden)",
+    "RDP listen address",
+    "RDP username",
+    "RDP password (hidden; blank generates)",
+];
+
+const COMPACT_LABELS: [&str; 7] = [
+    "VNC target",
+    "SSH host",
+    "VNC username",
+    "VNC password",
+    "RDP listen",
+    "RDP username",
+    "RDP password",
+];
+
+fn render_form(
+    frame: &mut ratatui::Frame<'_>,
+    fields: &Fields,
+    selected: usize,
+    error: &str,
+    flags: [bool; 3],
+) {
+    let area = frame.area();
+    let bordered = area.height >= 30 && area.width >= 60;
+    let focused_only = area.height < 16;
+    let field_count = if focused_only { 1 } else { LABELS.len() };
+    let field_height = if bordered { 3 } else { 1 };
+    let mut constraints = vec![Constraint::Length(3)];
+    constraints.extend(std::iter::repeat_n(
+        Constraint::Length(field_height),
+        field_count,
+    ));
+    constraints.push(Constraint::Min(3));
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(u16::from(area.height >= 16))
+        .constraints(constraints)
+        .split(area);
+    frame.render_widget(
+        Paragraph::new("rdp2vnc · RDP/TLS/NLA → VNC\nTab/↑↓ field · F5 connect · Esc cancel\nF2 remote bind · F3 insecure VNC · F4 read-only"),
+        rows[0],
+    );
+    for offset in 0..field_count {
+        let i = if focused_only { selected } else { offset };
+        let text = if i == 3 || i == 6 {
+            "•".repeat(fields.0[i].chars().count())
+        } else {
+            fields.0[i].clone()
+        };
+        let style = if i == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let widget = if bordered {
+            Paragraph::new(text).block(Block::default().title(LABELS[i]).borders(Borders::ALL))
+        } else {
+            Paragraph::new(format!(
+                "{} {}: {text}",
+                if i == selected { ">" } else { " " },
+                COMPACT_LABELS[i]
+            ))
+        };
+        frame.render_widget(widget.style(style), rows[offset + 1]);
+    }
+    let [remote, insecure, read_only] = flags;
+    // Put validation first so even very short terminals show the failure.
+    let status = if error.is_empty() {
+        "SSH requires a known host key and key/agent authentication. Passwords are never saved."
+    } else {
+        error
+    };
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{status}\nRemote RDP: {remote}  Unencrypted VNC: {insecure}  Read-only: {read_only}"
+        ))
+        .wrap(Wrap { trim: false }),
+        rows[field_count + 1],
+    );
+}
+
 pub fn run() -> Result<Option<Setup>> {
     ensure!(
         io::stdin().is_terminal() && io::stderr().is_terminal(),
@@ -48,15 +136,6 @@ pub fn run() -> Result<Option<Setup>> {
     let _restore = Restore;
     execute!(io::stderr(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stderr()))?;
-    let labels = [
-        "VNC target",
-        "SSH user@host (optional)",
-        "VNC / Mac username (optional)",
-        "VNC password (hidden)",
-        "RDP listen address",
-        "RDP username",
-        "RDP password (hidden; blank generates)",
-    ];
     let mut fields = Fields(vec![
         "127.0.0.1:5900".into(),
         String::new(),
@@ -69,16 +148,14 @@ pub fn run() -> Result<Option<Setup>> {
     let (mut selected, mut error) = (0, String::new());
     let (mut remote, mut insecure, mut read_only) = (false, false, false);
     loop {
-        terminal.draw(|f|{
-            let rows=Layout::default().direction(Direction::Vertical).margin(1)
-                .constraints([Constraint::Length(3),Constraint::Length(3),Constraint::Length(3),Constraint::Length(3),Constraint::Length(3),Constraint::Length(3),Constraint::Length(3),Constraint::Length(3),Constraint::Min(1)]).split(f.area());
-            f.render_widget(Paragraph::new("rdp2vnc · RDP/TLS/NLA → VNC\nTab/↑↓ field · F5 connect · F2 remote bind · F3 insecure VNC · F4 read-only · Esc cancel"),rows[0]);
-            for (i,label) in labels.iter().enumerate(){
-                let text=if i==3||i==6{"•".repeat(fields.0[i].chars().count())}else{fields.0[i].clone()};
-                let style=if i==selected{Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)}else{Style::default()};
-                f.render_widget(Paragraph::new(text).block(Block::default().title(*label).borders(Borders::ALL)).style(style),rows[i+1]);
-            }
-            f.render_widget(Paragraph::new(format!("Remote RDP: {remote}  Unencrypted VNC: {insecure}  Read-only: {read_only}\n{error}\nSSH requires a known host key and existing key/agent authentication. No passwords are persisted.")),rows[8]);
+        terminal.draw(|frame| {
+            render_form(
+                frame,
+                &fields,
+                selected,
+                &error,
+                [remote, insecure, read_only],
+            );
         })?;
         if !event::poll(Duration::from_millis(200))? {
             continue;
@@ -149,6 +226,55 @@ pub fn run() -> Result<Option<Setup>> {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn validation_is_visible_and_passwords_masked_at_common_terminal_sizes() {
+        for (width, height, selected) in [
+            (80, 24, 3),
+            (80, 30, 3),
+            (80, 16, 3),
+            (40, 10, 3),
+            (40, 10, 6),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let fields = Fields(vec![
+                "localhost:5900".into(),
+                String::new(),
+                String::new(),
+                "private-password".into(),
+                "127.0.0.1:3390".into(),
+                "rdp2vnc".into(),
+                "another-secret".into(),
+            ]);
+            terminal
+                .draw(|frame| {
+                    render_form(frame, &fields, selected, "invalid VNC target", [false; 3]);
+                })
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("invalid VNC target"), "{width}x{height}");
+            assert!(rendered.contains(if selected == 3 {
+                "VNC password"
+            } else {
+                "RDP password"
+            }));
+            assert!(rendered.contains('•'));
+            assert!(!rendered.contains("private-password"));
+            assert!(!rendered.contains("another-secret"));
         }
     }
 }
