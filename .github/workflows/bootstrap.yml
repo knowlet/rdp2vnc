@@ -1,0 +1,61 @@
+# Temporary bootstrap for this implementation branch; removed before merge.
+name: Bootstrap bridge
+on:
+  push:
+    branches: [feat/rust-rdp-vnc-bridge]
+    paths: [.github/workflows/bootstrap.yml]
+permissions:
+  contents: write
+jobs:
+  prepare:
+    if: github.repository == 'knowlet/rdp2vnc' && github.ref == 'refs/heads/feat/rust-rdp-vnc-bridge'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/rust-rdp-vnc-bridge
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: Apply reviewed API and shutdown fixes
+        shell: python
+        run: |
+          from pathlib import Path
+          def edit(name, old, new, count=1):
+              path = Path(name)
+              text = path.read_text()
+              assert text.count(old) == count, (name, old, text.count(old))
+              path.write_text(text.replace(old, new))
+          edit('Cargo.toml', 'version = "=0.13.0", default-features', 'git = "https://github.com/Devolutions/IronRDP", rev = "8e76c3168da578826d8fd707503655ea16bd3392", default-features')
+          edit('src/bridge.rs', 'let(mut frame)=', 'let mut frame=')
+          edit('src/input.rs', "0x38=>0xffea,", "0x38=>if mac {0xffea}else{0xfe03},")
+          edit('src/input.rs', '0x5b=>if mac {0xffeb}else{0xffeb}', '0x5b=>0xffeb')
+          edit('src/input.rs', '(i32::from(self.x)+x)', 'i32::from(self.x).saturating_add(x)', 2)
+          edit('src/input.rs', '(i32::from(self.y)+y)', 'i32::from(self.y).saturating_add(y)', 2)
+          edit('src/main.rs', 'auth,bridge,framebuffer,input,rfb,transport', 'auth,bridge,input,rfb,transport')
+          edit('src/main.rs', '    // Deliberately do not enable dependency TRACE or TLS key logging by default.\n    tracing_subscriber::fmt().with_writer(std::io::stderr)\n        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_|"warn,rdp2vnc=info".into())).init();', '    // Never enable upstream credential/packet debug logs through RUST_LOG.\n    let level=std::env::var("RDP2VNC_LOG").unwrap_or_else(|_|"info".into()).parse::<tracing::Level>().context("RDP2VNC_LOG must be error, warn, info, debug, or trace")?;\n    tracing_subscriber::fmt().with_writer(std::io::stderr)\n        .with_env_filter(tracing_subscriber::EnvFilter::new(format!("off,rdp2vnc={level}"))).init();')
+          edit('src/main.rs', '    let outcome=tokio::select! {', '    let mut vnc_completed=false;\n    let outcome=tokio::select! {')
+          edit('src/main.rs', 'result=&mut vnc=>match result{Ok(result)=>result,Err(error)=>Err(error).context("VNC worker failed")},', 'result=&mut vnc=>{vnc_completed=true;match result{Ok(result)=>result,Err(error)=>Err(error).context("VNC worker failed")}},')
+          edit('src/main.rs', '    vnc.abort();let _=vnc.await;', '    if !vnc_completed {vnc.abort();let _=vnc.await;}')
+          edit('src/tui.rs', 'execute!(io::stderr(),LeaveAlternateScreen)', 'execute!(io::stderr(),LeaveAlternateScreen,crossterm::cursor::Show)')
+      - name: Lock dependencies and format
+        run: |
+          cargo generate-lockfile
+          cargo fmt --all
+      - name: Commit generated lockfile and reviewed fixes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock src
+          git diff --cached --check
+          git commit -m 'fix: pin compatible RDP APIs and harden session cleanup'
+          git push origin HEAD:refs/heads/feat/rust-rdp-vnc-bridge
+      - name: Test exact generated tree
+        run: cargo test --locked --all-targets
+      - name: Clippy
+        if: always()
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Format
+        if: always()
+        run: cargo fmt --all -- --check
