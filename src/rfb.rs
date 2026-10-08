@@ -8,7 +8,12 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio_rustls::{TlsConnector, rustls};
@@ -38,8 +43,19 @@ pub struct Options {
 
 #[derive(Debug)]
 pub enum Input {
-    Key { down: bool, keysym: u32 },
-    Pointer { mask: u8, x: u16, y: u16 },
+    Key {
+        down: bool,
+        keysym: u32,
+    },
+    Pointer {
+        mask: u8,
+        x: u16,
+        y: u16,
+    },
+    PointerMove {
+        mask: u8,
+        position: Arc<Mutex<(u16, u16)>>,
+    },
     Reset,
 }
 
@@ -190,9 +206,7 @@ async fn vencrypt(mut stream: BoxWire, host: &str, options: &Options) -> Result<
             roots.add(cert)?;
         }
     }
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let config = client_tls_config(roots);
     let name = rustls::pki_types::ServerName::try_from(host.to_owned())
         .context("invalid VNC TLS server name")?;
     let tls = TlsConnector::from(Arc::new(config))
@@ -221,6 +235,13 @@ async fn vencrypt(mut stream: BoxWire, host: &str, options: &Options) -> Result<
     }
     stream.flush().await?;
     Ok((stream, if subtype == 260 { 1 } else { 2 }))
+}
+
+fn client_tls_config(roots: rustls::RootCertStore) -> rustls::ClientConfig {
+    // Keep rustls's NoKeyLog default; SSLKEYLOGFILE must not expose session keys.
+    rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth()
 }
 
 impl Client {
@@ -395,6 +416,16 @@ async fn write_inputs<W: AsyncWrite + Unpin>(
                         pressed.remove(&keysym);
                     }
                     key(&mut writer, down, keysym).await?;
+                }
+                Event::Input(Input::PointerMove {
+                    mask,
+                    position: pending,
+                }) => {
+                    let (x, y) = *pending.lock().expect("pointer position lock poisoned");
+                    // End this coalescing run before awaiting network writes.
+                    drop(pending);
+                    position = (x, y);
+                    pointer(&mut writer, mask, x, y).await?;
                 }
                 Event::Input(Input::Pointer { mask, x, y }) => {
                     position = (x, y);
@@ -734,6 +765,93 @@ async fn read_frames<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vnc_tls_config_does_not_enable_key_logging() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = client_tls_config(rustls::RootCertStore::empty());
+        for label in [
+            "CLIENT_RANDOM",
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "SERVER_TRAFFIC_SECRET_0",
+            "EXPORTER_SECRET",
+        ] {
+            assert!(!config.key_log.will_log(label), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_releases_shared_keysym_once_after_one_scancode_releases() {
+        use ironrdp_server::{KeyboardEvent, RdpServerInputHandler};
+        let (tx, rx) = mpsc::channel(16);
+        let (_request_tx, requests) = mpsc::channel(1);
+        let mut handler = crate::input::Handler::new(
+            tx.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            false,
+            false,
+        );
+        for extended in [false, true, true] {
+            handler.keyboard(KeyboardEvent::Pressed {
+                code: 0x47,
+                extended,
+            });
+        }
+        handler.keyboard(KeyboardEvent::Released {
+            code: 0x47,
+            extended: false,
+        });
+        tx.send(Input::Reset).await.unwrap();
+        tx.send(Input::Reset).await.unwrap();
+        drop(handler);
+        drop(tx);
+        let mut wire = Vec::new();
+        write_inputs(&mut wire, rx, requests).await.unwrap();
+        let mut expected = Vec::new();
+        for down in [true, true, true, false] {
+            expected.extend_from_slice(&[4, u8::from(down), 0, 0, 0, 0, 0xff, 0x50]);
+        }
+        // Both resets clear buttons, but the second does not release keys again.
+        expected.extend_from_slice(&[5, 0, 0, 0, 0, 0]);
+        expected.extend_from_slice(&[5, 0, 0, 0, 0, 0]);
+        assert_eq!(wire, expected);
+    }
+
+    #[tokio::test]
+    async fn writer_sends_latest_motion_and_preserves_button_edges() {
+        use ironrdp_server::{MouseButton, MouseEvent, RdpServerInputHandler};
+        let (tx, rx) = mpsc::channel(16);
+        let (_request_tx, requests) = mpsc::channel(1);
+        let mut handler = crate::input::Handler::new(
+            tx.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            false,
+            false,
+        );
+        for x in 1..=1000 {
+            handler.mouse(MouseEvent::Move { x, y: 10 });
+        }
+        handler.mouse(MouseEvent::Button {
+            x: 1000,
+            y: 10,
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        handler.mouse(MouseEvent::Move { x: 2000, y: 20 });
+        tx.send(Input::Reset).await.unwrap();
+        drop(handler);
+        drop(tx);
+        let mut wire = Vec::new();
+        write_inputs(&mut wire, rx, requests).await.unwrap();
+        assert_eq!(
+            wire,
+            [
+                5, 0, 3, 232, 0, 10, 5, 1, 3, 232, 0, 10, 5, 1, 7, 208, 0, 20, 5, 0, 7, 208, 0, 20,
+            ]
+        );
+    }
+
     #[test]
     fn versions_include_apple_but_do_not_force_legacy() {
         assert_eq!(negotiate_version(b"RFB 003.889\n").unwrap(), (8, true));

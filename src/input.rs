@@ -2,7 +2,10 @@
 use crate::rfb::Input;
 use clap::ValueEnum;
 use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, Weak},
+};
 use tokio::sync::{Notify, mpsc};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -197,6 +200,7 @@ pub struct Handler {
     read_only: bool,
     mac: bool,
     pressed: BTreeMap<(u8, bool), u32>,
+    pending_motion: Option<Weak<Mutex<(u16, u16)>>>,
     caps: bool,
     num: bool,
     surrogate_down: Option<u16>,
@@ -215,6 +219,7 @@ impl Handler {
             read_only,
             mac,
             pressed: BTreeMap::new(),
+            pending_motion: None,
             caps: false,
             num: false,
             surrogate_down: None,
@@ -226,7 +231,9 @@ impl Handler {
             horizontal: 0,
         }
     }
-    fn send(&self, event: Input) {
+    fn send(&mut self, event: Input) {
+        // A key/button edge is an ordering barrier for motion coalescing.
+        self.pending_motion = None;
         // Never silently drop a key-up: bounded queue exhaustion closes the bridge.
         if !self.read_only && self.tx.try_send(event).is_err() {
             self.fatal.notify_one();
@@ -254,7 +261,27 @@ impl Handler {
             self.send(Input::Key { down, keysym });
         }
     }
-    fn send_pointer(&self, mask: u8) {
+    fn move_pointer(&mut self) {
+        if self.read_only {
+            return;
+        }
+        if let Some(position) = self.pending_motion.as_ref().and_then(Weak::upgrade) {
+            *position.lock().expect("pointer position lock poisoned") = (self.x, self.y);
+            return;
+        }
+        // At most one queued move per uninterrupted motion run. Critical edges
+        // remain ordered; motion alone cannot exhaust the input queue.
+        let position = Arc::new(Mutex::new((self.x, self.y)));
+        self.pending_motion = Some(Arc::downgrade(&position));
+        match self.tx.try_send(Input::PointerMove {
+            mask: self.buttons,
+            position,
+        }) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => self.fatal.notify_one(),
+        }
+    }
+    fn send_pointer(&mut self, mask: u8) {
         self.send(Input::Pointer {
             mask,
             x: self.x,
@@ -323,10 +350,14 @@ impl RdpServerInputHandler for Handler {
             }
             KeyboardEvent::Released { code, extended } => {
                 if let Some(keysym) = self.pressed.remove(&(code, extended)) {
-                    self.send(Input::Key {
-                        down: false,
-                        keysym,
-                    });
+                    // Different physical keys (for example Home and keypad 7)
+                    // can hold the same RFB keysym. Repeats do not add owners.
+                    if !self.pressed.values().any(|&held| held == keysym) {
+                        self.send(Input::Key {
+                            down: false,
+                            keysym,
+                        });
+                    }
                 }
             }
             KeyboardEvent::UnicodePressed(v) => self.unicode(v, true),
@@ -345,7 +376,7 @@ impl RdpServerInputHandler for Handler {
             MouseEvent::Move { x, y } => {
                 self.x = x;
                 self.y = y;
-                self.send_pointer(self.buttons);
+                self.move_pointer();
             }
             MouseEvent::Button {
                 x,
@@ -376,7 +407,7 @@ impl RdpServerInputHandler for Handler {
             MouseEvent::RelMove { x, y } => {
                 self.x = i32::from(self.x).saturating_add(x).clamp(0, 65535) as u16;
                 self.y = i32::from(self.y).saturating_add(y).clamp(0, 65535) as u16;
-                self.send_pointer(self.buttons);
+                self.move_pointer();
             }
             _ => {}
         }
@@ -464,6 +495,227 @@ mod tests {
             })
         ));
     }
+    #[test]
+    fn motion_bursts_coalesce_and_leave_room_for_edges() {
+        let (tx, mut rx) = mpsc::channel(256);
+        let mut h = Handler::new(tx, Arc::new(Notify::new()), false, false);
+        for x in 0..10_000 {
+            h.mouse(MouseEvent::Move { x, y: 12 });
+        }
+        assert_eq!(rx.len(), 1);
+        h.keyboard(KeyboardEvent::Pressed {
+            code: 0x1e,
+            extended: false,
+        });
+        h.mouse(MouseEvent::Button {
+            x: 10_000,
+            y: 12,
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        h.keyboard(KeyboardEvent::Released {
+            code: 0x1e,
+            extended: false,
+        });
+        h.mouse(MouseEvent::Button {
+            x: 10_000,
+            y: 12,
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        let Input::PointerMove { mask, position } = rx.try_recv().unwrap() else {
+            panic!("expected coalesced motion");
+        };
+        assert_eq!(mask, 0);
+        assert_eq!(*position.lock().unwrap(), (9_999, 12));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Input::Key {
+                down: true,
+                keysym: 97
+            })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Input::Pointer {
+                mask: 1,
+                x: 10_000,
+                y: 12
+            })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Input::Key {
+                down: false,
+                keysym: 97
+            })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Input::Pointer {
+                mask: 0,
+                x: 10_000,
+                y: 12
+            })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn motion_coalescing_never_crosses_key_or_button_edges() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut h = Handler::new(tx, Arc::new(Notify::new()), false, false);
+        h.mouse(MouseEvent::Move { x: 1, y: 2 });
+        h.keyboard(KeyboardEvent::Pressed {
+            code: 0x1e,
+            extended: false,
+        });
+        h.mouse(MouseEvent::Move { x: 3, y: 4 });
+        h.mouse(MouseEvent::Button {
+            x: 5,
+            y: 6,
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        h.mouse(MouseEvent::Move { x: 7, y: 8 });
+        h.mouse(MouseEvent::RelMove { x: 2, y: -2 });
+        h.mouse(MouseEvent::Button {
+            x: 9,
+            y: 6,
+            button: MouseButton::Left,
+            pressed: false,
+        });
+        for (mask, expected) in [(0, (1, 2)), (0, (3, 4)), (1, (9, 6))] {
+            let Input::PointerMove {
+                mask: actual,
+                position,
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("expected motion before edge");
+            };
+            assert_eq!(actual, mask);
+            assert_eq!(*position.lock().unwrap(), expected);
+            match rx.try_recv().unwrap() {
+                Input::Key {
+                    down: true,
+                    keysym: 97,
+                } if expected == (1, 2) => {}
+                Input::Pointer {
+                    mask: 1,
+                    x: 5,
+                    y: 6,
+                } if expected == (3, 4) => {}
+                Input::Pointer {
+                    mask: 0,
+                    x: 9,
+                    y: 6,
+                } if expected == (9, 6) => {}
+                other => panic!("unexpected edge: {other:?}"),
+            }
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn consumed_motion_allows_another_motion_to_queue() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut h = Handler::new(tx, Arc::new(Notify::new()), false, false);
+        h.mouse(MouseEvent::Move { x: 1, y: 2 });
+        drop(rx.try_recv().unwrap());
+        h.mouse(MouseEvent::Move { x: 3, y: 4 });
+        let Input::PointerMove { position, .. } = rx.try_recv().unwrap() else {
+            panic!("expected a new motion");
+        };
+        assert_eq!(*position.lock().unwrap(), (3, 4));
+    }
+
+    #[tokio::test]
+    async fn full_queue_drops_motion_but_never_silently_drops_key_edges() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let fatal = Arc::new(Notify::new());
+        let mut h = Handler::new(tx, fatal.clone(), false, false);
+        h.keyboard(KeyboardEvent::Pressed {
+            code: 0x1e,
+            extended: false,
+        });
+        h.mouse(MouseEvent::Move { x: 1, y: 2 });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), fatal.notified())
+                .await
+                .is_err()
+        );
+        h.keyboard(KeyboardEvent::Released {
+            code: 0x1e,
+            extended: false,
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), fatal.notified())
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Input::Key {
+                down: true,
+                keysym: 97
+            })
+        ));
+        h.mouse(MouseEvent::Move { x: 3, y: 4 });
+        assert!(matches!(rx.try_recv(), Ok(Input::PointerMove { .. })));
+    }
+
+    #[test]
+    fn shared_keysym_releases_only_after_last_scancode_even_with_repeats() {
+        for first_release in [false, true] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let mut h = Handler::new(tx, Arc::new(Notify::new()), false, false);
+            // Navigation Home and NumLock-off keypad 7 both map to XK_Home.
+            for extended in [false, true, false, true] {
+                h.keyboard(KeyboardEvent::Pressed {
+                    code: 0x47,
+                    extended,
+                });
+                assert!(matches!(
+                    rx.try_recv(),
+                    Ok(Input::Key {
+                        down: true,
+                        keysym: 0xff50
+                    })
+                ));
+            }
+            h.keyboard(KeyboardEvent::Released {
+                code: 0x47,
+                extended: first_release,
+            });
+            assert!(rx.try_recv().is_err());
+            h.keyboard(KeyboardEvent::Pressed {
+                code: 0x47,
+                extended: !first_release,
+            });
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(Input::Key {
+                    down: true,
+                    keysym: 0xff50
+                })
+            ));
+            h.keyboard(KeyboardEvent::Released {
+                code: 0x47,
+                extended: !first_release,
+            });
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(Input::Key {
+                    down: false,
+                    keysym: 0xff50
+                })
+            ));
+            h.keyboard(KeyboardEvent::Released {
+                code: 0x47,
+                extended: !first_release,
+            });
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
     #[test]
     fn read_only_really_blocks_input() {
         let (tx, mut rx) = mpsc::channel(8);
