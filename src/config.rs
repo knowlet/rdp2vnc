@@ -1,7 +1,11 @@
 use crate::{input::Keymap, rfb::Auth, transport::Endpoint};
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
-use std::{io::IsTerminal, net::SocketAddr, path::PathBuf};
+use std::{
+    io::{IsTerminal, Read},
+    net::SocketAddr,
+    path::PathBuf,
+};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -134,18 +138,25 @@ pub fn secret(env_name: &str, file: Option<&PathBuf>) -> Result<Option<Zeroizing
                 "password file is readable by other users; chmod 600 it"
             );
         }
-        let value = std::fs::read_to_string(path).context("reading UTF-8 password file")?;
-        // Strip exactly one conventional line ending; spaces are part of a password.
-        Some(
-            value
-                .strip_suffix("\r\n")
-                .or_else(|| value.strip_suffix('\n'))
-                .unwrap_or(&value)
-                .to_owned(),
-        )
+        // Keep the allocation guarded even on read/validation errors. Reserve
+        // the full bounded read so growth cannot leave previous secret buffers.
+        let mut value = Zeroizing::new(String::with_capacity(4097));
+        std::fs::File::open(path)?
+            .take(4097)
+            .read_to_string(&mut value)
+            .context("reading UTF-8 password file")?;
+        ensure!(value.len() <= 4096, "password file exceeds 4096 bytes");
+        // Strip exactly one conventional line ending in place; preserve spaces.
+        if value.ends_with("\r\n") {
+            let length = value.len() - 2;
+            value.truncate(length);
+        } else if value.ends_with('\n') {
+            value.pop();
+        }
+        Some(value)
     } else {
         match std::env::var(env_name) {
-            Ok(value) => Some(value),
+            Ok(value) => Some(Zeroizing::new(value)),
             Err(std::env::VarError::NotPresent) => None,
             Err(error) => return Err(error).context("password environment variable is not UTF-8"),
         }
@@ -156,7 +167,7 @@ pub fn secret(env_name: &str, file: Option<&PathBuf>) -> Result<Option<Zeroizing
                 !v.is_empty() && v.len() <= 1024 && !v.contains(['\0', '\r', '\n']),
                 "password must be nonempty, at most 1024 bytes, and contain no NUL/newline"
             );
-            Ok(Zeroizing::new(v))
+            Ok(v)
         })
         .transpose()
 }
@@ -226,5 +237,22 @@ mod tests {
         assert!(Args::try_parse_from(["rdp2vnc", "localhost", "--password", "secret"]).is_err());
         assert!(Args::try_parse_from(["rdp2vnc", "localhost", "--fps", "0"]).is_err());
         assert!(Args::try_parse_from(["rdp2vnc", "localhost", "--cert", "only.pem"]).is_err());
+    }
+    #[test]
+    fn password_files_preserve_spaces_and_trim_only_one_line_ending() {
+        use std::io::Write;
+        for ending in ["", "\n", "\r\n"] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            write!(file, "  password  {ending}").unwrap();
+            let value = secret("UNUSED", Some(&file.path().to_owned()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(value.as_str(), "  password  ");
+        }
+        for invalid in ["", "\n", "password\n\n", "password\r", "pass\0word"] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(invalid.as_bytes()).unwrap();
+            assert!(secret("UNUSED", Some(&file.path().to_owned())).is_err());
+        }
     }
 }
