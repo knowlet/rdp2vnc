@@ -77,6 +77,15 @@ impl RdpServerDisplay for Display {
         }))
     }
 }
+// Keep the immutable snapshot alive for every Bytes clone/slice held by the
+// encoder. The mutable RFB framebuffer is separate from this published snapshot.
+struct FramePixels(Arc<Frame>);
+impl AsRef<[u8]> for FramePixels {
+    fn as_ref(&self) -> &[u8] {
+        &self.0.pixels
+    }
+}
+
 fn bitmap(frame: Arc<Frame>) -> DisplayUpdate {
     DisplayUpdate::Bitmap(BitmapUpdate {
         x: 0,
@@ -84,7 +93,7 @@ fn bitmap(frame: Arc<Frame>) -> DisplayUpdate {
         width: NonZeroU16::new(frame.width).expect("validated width"),
         height: NonZeroU16::new(frame.height).expect("validated height"),
         format: PixelFormat::BgrX32,
-        data: bytes::Bytes::copy_from_slice(&frame.pixels),
+        data: bytes::Bytes::from_owner(FramePixels(frame.clone())),
         stride: NonZeroUsize::new(usize::from(frame.width) * 4).expect("validated stride"),
     })
 }
@@ -403,5 +412,103 @@ mod tests {
         assert_eq!(completed_peer, peer);
         assert!(outcome.is_ok());
         assert_eq!(connections.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    // Explicitly opt in: timings are observations, never pass/fail thresholds.
+    #[test]
+    #[ignore = "local framebuffer handoff benchmark"]
+    fn measure_bitmap_handoff() {
+        for (width, height) in [(1920, 1080), (3840, 2160), (5120, 2880), (8192, 2048)] {
+            let mut frame = Frame::new(width, height).unwrap();
+            frame.pixels.fill(73);
+            let frame = Arc::new(frame);
+            for copy in [true, false] {
+                let start = std::time::Instant::now();
+                for _ in 0..200 {
+                    let frame = std::hint::black_box(frame.clone());
+                    let update = if copy {
+                        // Reference implementation from PR #1, for a same-build baseline.
+                        DisplayUpdate::Bitmap(BitmapUpdate {
+                            x: 0,
+                            y: 0,
+                            width: NonZeroU16::new(frame.width).unwrap(),
+                            height: NonZeroU16::new(frame.height).unwrap(),
+                            format: PixelFormat::BgrX32,
+                            data: bytes::Bytes::copy_from_slice(&frame.pixels),
+                            stride: NonZeroUsize::new(usize::from(frame.width) * 4).unwrap(),
+                        })
+                    } else {
+                        bitmap(frame)
+                    };
+                    std::hint::black_box(update);
+                }
+                eprintln!(
+                    "handoff {width}x{height} copy={copy}: {:.3} ms / 200 updates ({} bytes/frame)",
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    frame.pixels.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bitmap_shares_pixels_and_releases_owner_after_last_slice() {
+        let mut frame = Frame::new(4, 4).unwrap();
+        frame.pixels.fill(73);
+        let frame = Arc::new(frame);
+        let owner = Arc::downgrade(&frame);
+        let DisplayUpdate::Bitmap(update) = bitmap(frame.clone()) else {
+            panic!("missing bitmap");
+        };
+        assert_eq!(update.data.as_ptr(), frame.pixels.as_ptr());
+        let slice = update.data.clone().slice(4..8);
+        drop(frame);
+        drop(update);
+        assert!(owner.upgrade().is_some());
+        assert_eq!(&slice[..], &[73; 4]);
+        drop(slice);
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_sessions_release_admission_and_snapshot_owners() {
+        let active = Arc::new(AtomicBool::new(false));
+        let (inputs, mut input_rx) = mpsc::channel(256);
+        let (frames, receiver) = watch::channel(Arc::new(Frame::new(64, 64).unwrap()));
+        for n in 0..1000 {
+            let admission = Admission::new(active.clone());
+            admission.authenticate();
+            assert!(admission.admitted.load(Ordering::Acquire));
+            let mut display = Display::new(receiver.clone());
+            let mut updates = display.updates().await.unwrap();
+            let old = Arc::downgrade(&frames.borrow());
+            let expected_pixel = frames.borrow().pixels[0];
+            let Some(DisplayUpdate::Bitmap(snapshot)) = updates.next_update().await.unwrap() else {
+                panic!("missing reconnect snapshot");
+            };
+            let mut frame = Frame::new(64, 64).unwrap();
+            frame.pixels.fill((n % 256) as u8);
+            frames.send_replace(Arc::new(frame));
+            assert_eq!(snapshot.data.len(), 64 * 64 * 4);
+            assert!(snapshot.data.iter().all(|&byte| byte == expected_pixel));
+            drop(snapshot);
+            drop(updates);
+            drop(display);
+            assert!(
+                old.upgrade().is_none(),
+                "previous snapshot retained after disconnect"
+            );
+            admission.finish(&inputs).await.unwrap();
+            assert!(matches!(input_rx.try_recv(), Ok(Input::Reset)));
+            assert!(!active.load(Ordering::Acquire));
+        }
+        assert_eq!(Arc::strong_count(&active), 1);
+        assert_eq!(frames.receiver_count(), 1);
+        assert_eq!(inputs.capacity(), 256);
     }
 }
