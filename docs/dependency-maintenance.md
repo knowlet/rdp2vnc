@@ -7,7 +7,8 @@ Update the 14 registry packages identified from implementation PR #1 head
 `feat/rust-rdp-vnc-bridge`, independently of performance PR #2. Both follow-ups
 require PR #1's implementation, but neither requires the other. Target PR #1's
 branch until it is merged, then retarget/rebase onto develop. Do not duplicate
-the implementation diff. No merge is performed here.
+the implementation diff. A merge-tree compatibility check is used to keep the
+MSRV job separate from PR #2's Linux stress step; no merge is performed here.
 
 The application manifest and its Rust 1.94 requirement are unchanged. IronRDP
 stays pinned to `8e76c3168da578826d8fd707503655ea16bd3392`. Exactly 14 registry
