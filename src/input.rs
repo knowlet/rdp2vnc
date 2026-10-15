@@ -725,3 +725,47 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 }
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sustained_motion_and_edges_remain_bounded_and_ordered() {
+        let (tx, mut rx) = mpsc::channel(256);
+        let fatal = Arc::new(Notify::new());
+        let mut handler = Handler::new(tx.clone(), fatal.clone(), false, false);
+        for round in 0..1000 {
+            for x in 0..1000 {
+                handler.mouse(MouseEvent::Move { x, y: round });
+            }
+            handler.keyboard(KeyboardEvent::UnicodePressed(65));
+            handler.keyboard(KeyboardEvent::UnicodeReleased(65));
+            assert_eq!(rx.len(), 3);
+            let Input::PointerMove { position, .. } = rx.try_recv().unwrap() else {
+                panic!("missing coalesced motion");
+            };
+            assert_eq!(*position.lock().unwrap(), (999, round));
+            drop(position);
+            for expected in [true, false] {
+                assert!(
+                    matches!(rx.try_recv(), Ok(Input::Key { down, keysym: 65 }) if down == expected)
+                );
+            }
+        }
+        assert_eq!(tx.capacity(), 256);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), fatal.notified())
+                .await
+                .is_err()
+        );
+        // Critical overload retains the existing fail-closed behavior.
+        for _ in 0..257 {
+            handler.keyboard(KeyboardEvent::UnicodePressed(65));
+        }
+        assert_eq!(rx.len(), 256);
+        tokio::time::timeout(std::time::Duration::from_secs(1), fatal.notified())
+            .await
+            .unwrap();
+    }
+}
