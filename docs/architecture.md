@@ -16,7 +16,7 @@ Classic DES VNC authentication and ARD's DH/MD5/AES credential exchange are comp
 
 `rfb.rs` owns the authoritative BGRX framebuffer. Raw/Hextile/ZRLE updates and overlapping CopyRect operations are applied there. A Tokio watch channel retains the latest complete snapshot, not an unbounded backlog of deltas. Slow RDP clients may skip obsolete snapshots without corrupting CopyRect dependencies. Every new RDP client receives a complete snapshot, even if the VNC desktop is static.
 
-The adapter gives complete images to IronRDP's bitmap encoder. It does not inherit the legacy C project's 8192-byte row slicing bug. This is a correctness-first baseline: full-frame cloning/encoding costs CPU/memory on large displays. Dirty-region scheduling and codec tuning require benchmarks and are not advertised as completed optimizations.
+The adapter gives complete images to IronRDP's bitmap encoder. Its `Bytes` view owns an `Arc` to the immutable published snapshot, avoiding an additional whole-frame pixel copy; clones/slices retain that snapshot until the last view is dropped. It does not inherit the legacy C project's 8192-byte row slicing bug. This is a correctness-first baseline: full-frame cloning/encoding costs CPU/memory on large displays. Dirty-region scheduling and codec tuning require benchmarks and are not advertised as completed optimizations.
 
 DesktopSize updates resize the backend framebuffer and precede corresponding RDP pixels. Client window size is not permission to reconfigure the Mac's physical monitors. No unimplemented encoding is advertised. Unknown payload types fail closed rather than attempting an unsafe guessed skip.
 

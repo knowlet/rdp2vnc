@@ -58,3 +58,6 @@ jobs:
       - name: Real FreeRDP loopback integration
         if: runner.os == 'Linux'
         run: xvfb-run -a -s '-screen 0 1024x768x24' /usr/bin/python3 tests/e2e_freerdp.py
+      - name: Loopback connection resource stress
+        if: runner.os == 'Linux'
+        run: /usr/bin/python3 tests/stress_connections.py
