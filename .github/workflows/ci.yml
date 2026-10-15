@@ -12,6 +12,23 @@ concurrency:
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
 jobs:
+  msrv:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Minimum supported Rust
+        run: rustup toolchain install 1.94.0 --profile minimal
+      - name: Test on Rust 1.94
+        run: cargo +1.94.0 test --locked --all-targets
+      - name: Build CLI on Rust 1.94
+        run: cargo +1.94.0 build --locked
   test:
     strategy:
       fail-fast: false
