@@ -62,7 +62,7 @@ fn default_identity_in(
     }
 
     let mut random = [0; 16];
-    getrandom::getrandom(&mut random)
+    getrandom::fill(&mut random)
         .map_err(|error| anyhow::anyhow!("creating TLS staging directory name: {error}"))?;
     let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
     let staging = dir.join(format!(".identity-{suffix}"));
