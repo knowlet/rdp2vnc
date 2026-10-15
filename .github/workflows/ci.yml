@@ -1,0 +1,43 @@
+name: Rust CI
+on:
+  push:
+    branches: [develop, 'feat/**', 'fix/**']
+  pull_request:
+    branches: [develop]
+permissions:
+  contents: read
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: Test
+        run: cargo test --locked --all-targets
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Build CLI
+        run: cargo build --locked
+      - name: Install loopback E2E dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends freerdp3-x11 xvfb xauth xdotool python3-pil
+      - name: Real FreeRDP loopback integration
+        if: runner.os == 'Linux'
+        run: xvfb-run -a -s '-screen 0 1024x768x24' /usr/bin/python3 tests/e2e_freerdp.py
