@@ -7,7 +7,7 @@ use num_bigint::BigUint;
 use zeroize::{Zeroize, Zeroizing};
 
 pub fn random_bytes(bytes: &mut [u8]) -> Result<()> {
-    getrandom::getrandom(bytes).map_err(|e| anyhow::anyhow!("OS random source failed: {e}"))
+    getrandom::fill(bytes).map_err(|e| anyhow::anyhow!("OS random source failed: {e}"))
 }
 
 /// Classic VNC authentication uses an eight-byte, bit-reversed DES key.
