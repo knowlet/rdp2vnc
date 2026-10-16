@@ -2,13 +2,15 @@
 use super::*;
 use clap::Parser;
 
-fn certificate() -> (String, String) {
+fn certificate() -> (String, String, Vec<u8>) {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
         .unwrap()
         .self_signed(&key)
         .unwrap();
-    (cert.pem(), key.serialize_pem())
+    // The self-signed certificate embeds this raw public key as its subject key.
+    // Derive the expected value from the generator, not the production loader.
+    (cert.pem(), key.serialize_pem(), key.public_key_raw().to_vec())
 }
 
 fn args(dir: &Path, cert_name: &str, key_name: &str, cert: &[u8], key: &[u8]) -> Args {
@@ -25,7 +27,7 @@ fn args(dir: &Path, cert_name: &str, key_name: &str, cert: &[u8], key: &[u8]) ->
 
 #[test]
 fn pem_identity_and_legacy_extensions_preserve_certificate_and_key() {
-    let (cert, key) = certificate();
+    let (cert, key, expected_public_key) = certificate();
     for (cert_name, key_name) in [("server.pem", "key.pem"), ("server.crt", "server.key")] {
         let dir = tempfile::tempdir().unwrap();
         let args = args(
@@ -36,17 +38,79 @@ fn pem_identity_and_legacy_extensions_preserve_certificate_and_key() {
             key.as_bytes(),
         );
         let (acceptor, public_key) = identity(&args).unwrap();
-        assert!(!public_key.is_empty());
+        assert_eq!(public_key, expected_public_key);
         assert!(!acceptor.config().key_log.will_log("CLIENT_RANDOM"));
-        assert_eq!(identity(&args).unwrap().1, public_key);
+        assert_eq!(identity(&args).unwrap().1, expected_public_key);
         assert_eq!(fs::read(args.cert.unwrap()).unwrap(), cert.as_bytes());
         assert_eq!(fs::read(args.key.unwrap()).unwrap(), key.as_bytes());
     }
 }
 
 #[test]
+fn pem_identity_ignores_sslkeylogfile() {
+    const CHILD: &str = "RDP2VNC_PEM_IDENTITY_KEYLOG_TEST_CHILD";
+    const MARKER: &str = "identity keylog assertions completed";
+    if std::env::var_os(CHILD).is_none() {
+        // Set the environment on a child, never mutate the multithreaded test
+        // process environment. The child runs only this test with a writable log.
+        let dir = tempfile::tempdir().unwrap();
+        let keylog = dir.path().join("session-keys.log");
+        fs::write(&keylog, b"unchanged canary\n").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tls::pem_tests::pem_identity_ignores_sslkeylogfile",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("SSLKEYLOGFILE", &keylog)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "keylog child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains(MARKER));
+        assert_eq!(fs::read(keylog).unwrap(), b"unchanged canary\n");
+        return;
+    }
+
+    let keylog = PathBuf::from(std::env::var_os("SSLKEYLOGFILE").unwrap());
+    assert_eq!(fs::read(&keylog).unwrap(), b"unchanged canary\n");
+    let (cert, key, _) = certificate();
+    for (cert_name, key_name) in [("server.pem", "key.pem"), ("server.crt", "server.key")] {
+        let dir = tempfile::tempdir().unwrap();
+        let args = args(
+            dir.path(),
+            cert_name,
+            key_name,
+            cert.as_bytes(),
+            key.as_bytes(),
+        );
+        let (acceptor, _) = identity(&args).unwrap();
+        for label in [
+            "CLIENT_RANDOM",
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "SERVER_TRAFFIC_SECRET_0",
+            "EXPORTER_SECRET",
+        ] {
+            assert!(!acceptor.config().key_log.will_log(label));
+            // Even a direct callback must not append disposable dummy secrets.
+            acceptor.config().key_log.log(label, &[0; 32], &[0; 48]);
+        }
+    }
+    assert_eq!(fs::read(keylog).unwrap(), b"unchanged canary\n");
+    eprintln!("{MARKER}");
+}
+
+#[test]
 fn pem_identity_rejects_empty_damaged_certificates_without_rotation() {
-    let (_, key) = certificate();
+    let (_, key, _) = certificate();
     for cert in [
         "",
         " \r\n\t",
@@ -71,8 +135,10 @@ fn pem_identity_rejects_empty_damaged_certificates_without_rotation() {
 
 #[test]
 fn pem_identity_rejects_empty_damaged_or_mismatched_keys_without_rotation() {
-    let (cert, _) = certificate();
-    let (_, different_key) = certificate();
+    let (cert, _, _) = certificate();
+    let (_, different_key, _) = certificate();
+    // These intentionally invalid PEM bodies are not private keys: "!!!!" is
+    // invalid Base64, and "AQID" decodes to three bytes, not a PKCS#8 structure.
     for key in [
         "",
         " \r\n\t",
