@@ -22,7 +22,7 @@ ironrdp-server = { git = "https://github.com/Devolutions/IronRDP", rev = "8e76c3
 md-5 = "0.11"
 num-bigint = "0.5"
 ratatui = "0.29"
-rcgen = "0.13"
+rcgen = "0.14"
 rpassword = "7"
 rustls-pemfile = "2"
 sha2 = "0.11.1"
