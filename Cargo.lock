@@ -2195,6 +2195,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-bigint"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2757,7 +2767,7 @@ dependencies = [
  "getrandom 0.4.3",
  "ironrdp-server",
  "md-5 0.10.6",
- "num-bigint 0.4.8",
+ "num-bigint 0.5.1",
  "ratatui",
  "rcgen",
  "rpassword",
