@@ -10,7 +10,11 @@ fn certificate() -> (String, String, Vec<u8>) {
         .unwrap();
     // The self-signed certificate embeds this raw public key as its subject key.
     // Derive the expected value from the generator, not the production loader.
-    (cert.pem(), key.serialize_pem(), key.public_key_raw().to_vec())
+    (
+        cert.pem(),
+        key.serialize_pem(),
+        key.public_key_raw().to_vec(),
+    )
 }
 
 fn args(dir: &Path, cert_name: &str, key_name: &str, cert: &[u8], key: &[u8]) -> Args {
