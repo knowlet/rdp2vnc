@@ -50,6 +50,36 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Build CLI
         run: cargo build --locked
+      - name: Verify complete locked PEM dependency graph
+        if: runner.os == 'Linux'
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import subprocess
+          import tomllib
+
+          lock_path = pathlib.Path('Cargo.lock')
+          original = lock_path.read_bytes()
+          packages = tomllib.loads(original.decode('utf-8'))['package']
+          pem = [p for p in packages if p['name'] == 'rustls-pemfile']
+          consumers = {
+              p['name'] for p in packages
+              if any(d.split()[0] == 'rustls-pemfile' for d in p.get('dependencies', []))
+          }
+          if consumers - {'ironrdp-server'}:
+              raise SystemExit(f'Unexpected rustls-pemfile consumers: {sorted(consumers)}')
+          if pem:
+              print('RUSTSEC-2025-0134 remains in Cargo.lock; direct migration is not full removal.', flush=True)
+              print(f'Locked versions: {[p["version"] for p in pem]}; consumers: {sorted(consumers)}', flush=True)
+              subprocess.run([
+                  'cargo', 'tree', '--locked', '--target', 'all',
+                  '--edges', 'normal,build,dev', '--invert', 'rustls-pemfile',
+              ], check=True)
+          else:
+              print('rustls-pemfile is absent from the complete Cargo.lock; this is not a full security audit.', flush=True)
+          if lock_path.read_bytes() != original:
+              raise SystemExit('Dependency inspection unexpectedly changed Cargo.lock')
+          PY
       - name: Install loopback E2E dependencies
         if: runner.os == 'Linux'
         run: |
