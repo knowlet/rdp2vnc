@@ -24,6 +24,7 @@ jobs:
           python3 -u - <<'PY'
           from pathlib import Path
           import subprocess
+          import sys
           lines = Path('.github/workflows/issue-11-prepare.yml').read_text().splitlines()
           scripts = []
           index = 0
@@ -38,10 +39,22 @@ jobs:
                   index += 1
               scripts.append('\n'.join(body) + '\n')
           assert len(scripts) == 3, 'Unexpected preparation workflow structure'
+          old = 'assert!(matches!(tls_error, rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)), "{tls_error:?}");'
+          new = '''// Both generated certificates have the same issuer name but different keys.
+                      // Preserve the baseline distinction: no anchor versus a wrong-key anchor.
+                      if ca.is_some() {
+                          assert!(matches!(tls_error, rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature)), "{tls_error:?}");
+                      } else {
+                          assert!(matches!(tls_error, rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)), "{tls_error:?}");
+                      }'''
+          assert scripts[0].count(old) == 1
+          scripts[0] = scripts[0].replace(old, new)
           for name, script in zip(('Baseline regression tests', 'Migration and locked validation', 'Publish candidate'), scripts):
               # Normalize pre-existing CRLF before producing the CRLF fixture.
               script = script.replace("bundle.replace('\\n', \"\\r\\n\")", "bundle.replace(\"\\r\\n\", \"\\n\").replace('\\n', \"\\r\\n\")")
               print(f'::group::{name}', flush=True)
-              subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', script], check=True)
+              completed = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', script])
+              if completed.returncode:
+                  sys.exit(completed.returncode)
               print('::endgroup::', flush=True)
           PY
