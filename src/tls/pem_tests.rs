@@ -166,3 +166,51 @@ fn pem_identity_rejects_empty_damaged_or_mismatched_keys_without_rotation() {
         assert_eq!(fs::read(args.key.unwrap()).unwrap(), key.as_bytes());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn pem_identity_rejects_exposed_private_keys_without_modification() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (cert, key, expected_public_key) = certificate();
+    for (cert_name, key_name) in [("server.pem", "key.pem"), ("server.crt", "server.key")] {
+        let dir = tempfile::tempdir().unwrap();
+        let args = args(
+            dir.path(),
+            cert_name,
+            key_name,
+            cert.as_bytes(),
+            key.as_bytes(),
+        );
+        let cert_path = args.cert.as_ref().unwrap();
+        let key_path = args.key.as_ref().unwrap();
+        for mode in [0o640, 0o604, 0o644] {
+            fs::set_permissions(key_path, fs::Permissions::from_mode(mode)).unwrap();
+            let error = identity(&args)
+                .err()
+                .expect("group/world-readable private keys must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "TLS private key must not be group/world accessible; chmod 600 it"
+            );
+            assert_eq!(fs::read(cert_path).unwrap(), cert.as_bytes());
+            assert_eq!(fs::read(key_path).unwrap(), key.as_bytes());
+            assert_eq!(
+                fs::metadata(key_path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+        // Prove rejection was the permission gate, not a broken identity.
+        // Owner-read-only keys remain compatible; loading must not chmod them.
+        for mode in [0o600, 0o400] {
+            fs::set_permissions(key_path, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(identity(&args).unwrap().1, expected_public_key);
+            assert_eq!(fs::read(cert_path).unwrap(), cert.as_bytes());
+            assert_eq!(fs::read(key_path).unwrap(), key.as_bytes());
+            assert_eq!(
+                fs::metadata(key_path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+    }
+}
