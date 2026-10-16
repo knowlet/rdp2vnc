@@ -2798,7 +2798,6 @@ dependencies = [
  "ratatui",
  "rcgen",
  "rpassword",
- "rustls-pemfile",
  "sha2 0.11.1",
  "tempfile",
  "time",

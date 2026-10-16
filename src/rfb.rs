@@ -16,6 +16,10 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
+use tokio_rustls::rustls::pki_types::{
+    CertificateDer,
+    pem::{self, PemObject},
+};
 use tokio_rustls::{TlsConnector, rustls};
 use zeroize::Zeroizing;
 
@@ -200,7 +204,9 @@ async fn vencrypt(mut stream: BoxWire, host: &str, options: &Options) -> Result<
         let mut pem = std::io::BufReader::new(
             std::fs::File::open(path).context("opening VNC CA certificate")?,
         );
-        let certs = rustls_pemfile::certs(&mut pem).collect::<std::io::Result<Vec<_>>>()?;
+        let certs = CertificateDer::pem_reader_iter(&mut pem)
+            .map(|cert| cert.map_err(pem_error_to_io))
+            .collect::<std::io::Result<Vec<_>>>()?;
         ensure!(!certs.is_empty(), "VNC CA file contains no certificates");
         for cert in certs {
             roots.add(cert)?;
@@ -235,6 +241,31 @@ async fn vencrypt(mut stream: BoxWire, host: &str, options: &Options) -> Result<
     }
     stream.flush().await?;
     Ok((stream, if subtype == 260 { 1 } else { 2 }))
+}
+
+// Keep the previous parser's I/O error kind and diagnostics while using
+// the maintained PemObject implementation through rustls's supported re-export.
+fn pem_error_to_io(error: pem::Error) -> std::io::Error {
+    use std::io::{Error, ErrorKind};
+    match error {
+        pem::Error::Io(error) => error,
+        pem::Error::MissingSectionEnd { end_marker } => Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "section end {:?} missing",
+                String::from_utf8_lossy(&end_marker)
+            ),
+        ),
+        pem::Error::IllegalSectionStart { line } => Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "illegal section start: {:?}",
+                String::from_utf8_lossy(&line)
+            ),
+        ),
+        pem::Error::Base64Decode(error) => Error::new(ErrorKind::InvalidData, error),
+        other => Error::new(ErrorKind::InvalidData, format!("{other:?}")),
+    }
 }
 
 fn client_tls_config(roots: rustls::RootCertStore) -> rustls::ClientConfig {
@@ -944,3 +975,6 @@ mod tests {
         let _ = task.await;
     }
 }
+
+#[cfg(test)]
+mod pem_tests;
