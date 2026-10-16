@@ -359,3 +359,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pem_tests;
