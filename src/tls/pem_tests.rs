@@ -2,12 +2,17 @@
 use super::*;
 use clap::Parser;
 
-fn certificate() -> (String, String, Vec<u8>) {
+fn generated_certificate() -> (rcgen::Certificate, rcgen::KeyPair) {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
         .unwrap()
         .self_signed(&key)
         .unwrap();
+    (cert, key)
+}
+
+fn certificate() -> (String, String, Vec<u8>) {
+    let (cert, key) = generated_certificate();
     // The self-signed certificate embeds this raw public key as its subject key.
     // Derive the expected value from the generator, not the production loader.
     (
@@ -46,7 +51,7 @@ fn pem_identity_and_legacy_extensions_preserve_certificate_and_key() {
         assert!(!acceptor.config().key_log.will_log("CLIENT_RANDOM"));
         assert_eq!(identity(&args).unwrap().1, expected_public_key);
         assert_eq!(fs::read(args.cert.unwrap()).unwrap(), cert.as_bytes());
-        assert_eq!(fs::read(args.key.unwrap()).unwrap(), key.as_bytes());
+        assert!(fs::read(args.key.unwrap()).unwrap() == key.as_bytes());
     }
 }
 
@@ -123,17 +128,19 @@ fn pem_identity_rejects_empty_damaged_certificates_without_rotation() {
         "-----BEGIN CERTIFICATE-----\nAQID\n",
         "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let args = args(
-            dir.path(),
-            "server.pem",
-            "key.pem",
-            cert.as_bytes(),
-            key.as_bytes(),
-        );
-        assert!(identity(&args).is_err());
-        assert_eq!(fs::read(args.cert.unwrap()).unwrap(), cert.as_bytes());
-        assert_eq!(fs::read(args.key.unwrap()).unwrap(), key.as_bytes());
+        for (cert_name, key_name) in [("server.pem", "key.pem"), ("server.crt", "server.key")] {
+            let dir = tempfile::tempdir().unwrap();
+            let args = args(
+                dir.path(),
+                cert_name,
+                key_name,
+                cert.as_bytes(),
+                key.as_bytes(),
+            );
+            assert!(identity(&args).is_err());
+            assert_eq!(fs::read(args.cert.unwrap()).unwrap(), cert.as_bytes());
+            assert!(fs::read(args.key.unwrap()).unwrap() == key.as_bytes());
+        }
     }
 }
 
@@ -153,17 +160,209 @@ fn pem_identity_rejects_empty_damaged_or_mismatched_keys_without_rotation() {
         cert.as_str(),
         different_key.as_str(),
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let args = args(
-            dir.path(),
-            "server.pem",
-            "key.pem",
-            cert.as_bytes(),
-            key.as_bytes(),
-        );
-        assert!(identity(&args).is_err());
-        assert_eq!(fs::read(args.cert.unwrap()).unwrap(), cert.as_bytes());
-        assert_eq!(fs::read(args.key.unwrap()).unwrap(), key.as_bytes());
+        for (cert_name, key_name) in [("server.pem", "key.pem"), ("server.crt", "server.key")] {
+            let dir = tempfile::tempdir().unwrap();
+            let args = args(
+                dir.path(),
+                cert_name,
+                key_name,
+                cert.as_bytes(),
+                key.as_bytes(),
+            );
+            assert!(identity(&args).is_err());
+            assert_eq!(fs::read(args.cert.unwrap()).unwrap(), cert.as_bytes());
+            assert!(fs::read(args.key.unwrap()).unwrap() == key.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn legacy_identity_loader_only_accepts_pkcs8_key_sections() {
+    use ironrdp_server::ServerErrorKind;
+
+    let (cert, key) = generated_certificate();
+    for key_name in ["server.key", "server.PEM", "server"] {
+        for label in ["RSA PRIVATE KEY", "EC PRIVATE KEY", "ENCRYPTED PRIVATE KEY"] {
+            // Valid Base64 wrapping deliberately invalid DER distinguishes a
+            // rejected PEM label from later cryptographic key validation.
+            let unsupported = format!("-----BEGIN {label}-----\nAQID\n-----END {label}-----\n");
+            for (keys, has_pkcs8) in [
+                (unsupported.clone(), false),
+                (format!("{unsupported}{}", key.serialize_pem()), true),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let args = args(
+                    dir.path(),
+                    "server.crt",
+                    key_name,
+                    cert.pem().as_bytes(),
+                    keys.as_bytes(),
+                );
+                let loaded = TlsIdentityCtx::init_from_paths(
+                    args.cert.as_ref().unwrap(),
+                    args.key.as_ref().unwrap(),
+                );
+                if has_pkcs8 {
+                    let loaded = loaded.unwrap();
+                    assert!(loaded.priv_key.secret_der() == key.serialize_der());
+                    assert_eq!(loaded.pub_key, key.public_key_raw());
+                } else {
+                    let error = loaded
+                        .err()
+                        .expect("legacy loader must reject non-PKCS8 labels");
+                    assert!(matches!(
+                        error.kind(),
+                        ServerErrorKind::Reason(reason) if reason == "no private key"
+                    ));
+                }
+                assert_eq!(fs::read(args.cert.unwrap()).unwrap(), cert.pem().as_bytes());
+                assert!(fs::read(args.key.unwrap()).unwrap() == keys.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+fn pem_identity_uses_first_pkcs8_key_without_searching_for_a_match() {
+    let (cert, matching_key) = generated_certificate();
+    let (_, other_key) = generated_certificate();
+    for (cert_name, key_name) in [("server.pem", "key.pem"), ("server.crt", "server.key")] {
+        for (first, second, matches_cert) in [
+            (&matching_key, &other_key, true),
+            (&other_key, &matching_key, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let keys = format!("{}{}", first.serialize_pem(), second.serialize_pem());
+            let args = args(
+                dir.path(),
+                cert_name,
+                key_name,
+                cert.pem().as_bytes(),
+                keys.as_bytes(),
+            );
+            let loaded = TlsIdentityCtx::init_from_paths(
+                args.cert.as_ref().unwrap(),
+                args.key.as_ref().unwrap(),
+            )
+            .unwrap();
+            // Boolean comparisons do not print private key bytes on failure.
+            assert!(loaded.priv_key.secret_der() == first.serialize_der());
+            assert_eq!(loaded.pub_key, matching_key.public_key_raw());
+            if matches_cert {
+                assert_eq!(identity(&args).unwrap().1, matching_key.public_key_raw());
+            } else {
+                let error = identity(&args)
+                    .err()
+                    .expect("first key must match certificate");
+                assert_eq!(error.to_string(), "invalid RDP certificate/key pair");
+            }
+            assert_eq!(fs::read(args.cert.unwrap()).unwrap(), cert.pem().as_bytes());
+            assert!(fs::read(args.key.unwrap()).unwrap() == keys.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn pem_identity_only_parses_key_sections_up_to_the_first_pkcs8_key() {
+    let (cert, key, expected_public_key) = certificate();
+    for malformed in [
+        "-----BEGIN PRIVATE KEY-----\n!!!!\n-----END PRIVATE KEY-----\n",
+        "-----BEGIN PRIVATE KEY-----\nAQID\n",
+        "-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n",
+    ] {
+        for (cert_name, key_name) in [("server.pem", "key.pem"), ("server.crt", "server.key")] {
+            for (keys, valid_first) in [
+                (format!("{key}{malformed}"), true),
+                (format!("{malformed}{key}"), false),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let args = args(
+                    dir.path(),
+                    cert_name,
+                    key_name,
+                    cert.as_bytes(),
+                    keys.as_bytes(),
+                );
+                if valid_first {
+                    // The existing loader consumes only the first key. A bad
+                    // later section must not change the chosen identity.
+                    assert_eq!(identity(&args).unwrap().1, expected_public_key);
+                } else {
+                    // Neither a parse failure nor invalid DER in the first key
+                    // permits scanning ahead for a usable matching key.
+                    assert!(identity(&args).is_err());
+                }
+                assert_eq!(fs::read(args.cert.unwrap()).unwrap(), cert.as_bytes());
+                assert!(fs::read(args.key.unwrap()).unwrap() == keys.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+fn pem_identity_preserves_certificate_order_and_binds_nla_to_the_first_certificate() {
+    let (cert, key) = generated_certificate();
+    let (other_cert, other_key) = generated_certificate();
+    for (cert_name, key_name) in [("server.pem", "key.pem"), ("server.crt", "server.key")] {
+        for (first, second, expected_public_key, matches_key) in [
+            (&cert, &other_cert, key.public_key_raw(), true),
+            (&other_cert, &cert, other_key.public_key_raw(), false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let bundle = format!("{}{}", first.pem(), second.pem());
+            let args = args(
+                dir.path(),
+                cert_name,
+                key_name,
+                bundle.as_bytes(),
+                key.serialize_pem().as_bytes(),
+            );
+            let loaded = TlsIdentityCtx::init_from_paths(
+                args.cert.as_ref().unwrap(),
+                args.key.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(loaded.certs, [first.der().clone(), second.der().clone()]);
+            // NLA uses the subjectPublicKey BIT STRING bytes from the first
+            // certificate, not its SPKI wrapper or a later matching certificate.
+            assert_eq!(loaded.pub_key, expected_public_key);
+            if matches_key {
+                assert_eq!(identity(&args).unwrap().1, expected_public_key);
+            } else {
+                let error = identity(&args)
+                    .err()
+                    .expect("first certificate must match key");
+                assert_eq!(error.to_string(), "invalid RDP certificate/key pair");
+            }
+            assert_eq!(fs::read(args.cert.unwrap()).unwrap(), bundle.as_bytes());
+            assert!(fs::read(args.key.unwrap()).unwrap() == key.serialize_pem().as_bytes());
+        }
+    }
+}
+
+#[test]
+fn pem_identity_rejects_malformed_trailing_certificate_sections() {
+    let (cert, key, _) = certificate();
+    for malformed in [
+        "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+        "-----BEGIN CERTIFICATE-----\nAQID\n",
+    ] {
+        for (cert_name, key_name) in [("server.pem", "key.pem"), ("server.crt", "server.key")] {
+            let dir = tempfile::tempdir().unwrap();
+            let bundle = format!("{cert}{malformed}");
+            let args = args(
+                dir.path(),
+                cert_name,
+                key_name,
+                bundle.as_bytes(),
+                key.as_bytes(),
+            );
+            // Certificates are collected as a chain, so parsing cannot stop
+            // after the first valid entry as it does for the private key.
+            assert!(identity(&args).is_err());
+            assert_eq!(fs::read(args.cert.unwrap()).unwrap(), bundle.as_bytes());
+            assert!(fs::read(args.key.unwrap()).unwrap() == key.as_bytes());
+        }
     }
 }
 
@@ -194,7 +393,7 @@ fn pem_identity_rejects_exposed_private_keys_without_modification() {
                 "TLS private key must not be group/world accessible; chmod 600 it"
             );
             assert_eq!(fs::read(cert_path).unwrap(), cert.as_bytes());
-            assert_eq!(fs::read(key_path).unwrap(), key.as_bytes());
+            assert!(fs::read(key_path).unwrap() == key.as_bytes());
             assert_eq!(
                 fs::metadata(key_path).unwrap().permissions().mode() & 0o777,
                 mode
@@ -206,7 +405,7 @@ fn pem_identity_rejects_exposed_private_keys_without_modification() {
             fs::set_permissions(key_path, fs::Permissions::from_mode(mode)).unwrap();
             assert_eq!(identity(&args).unwrap().1, expected_public_key);
             assert_eq!(fs::read(cert_path).unwrap(), cert.as_bytes());
-            assert_eq!(fs::read(key_path).unwrap(), key.as_bytes());
+            assert!(fs::read(key_path).unwrap() == key.as_bytes());
             assert_eq!(
                 fs::metadata(key_path).unwrap().permissions().mode() & 0o777,
                 mode

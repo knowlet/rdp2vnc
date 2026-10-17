@@ -1,0 +1,555 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 7e3280ae..c3a86b61 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3334,7 +3334,6 @@ dependencies = [
+  "qoicoubeh",
+  "rand 0.9.4",
+  "rayon",
+- "rustls-pemfile",
+  "tokio",
+  "tokio-rustls",
+  "tracing",
+@@ -3475,12 +3474,14 @@ dependencies = [
+  "ironrdp-viewer",
+  "ironrdp-vmconnect",
+  "rcgen",
++ "rstest",
+  "semver",
+  "tokio",
+  "tokio-rustls",
+  "tracing",
+  "tracing-subscriber",
+  "uuid",
++ "x509-cert",
+ ]
+ 
+ [[package]]
+@@ -5773,15 +5774,6 @@ dependencies = [
+  "security-framework",
+ ]
+ 
+-[[package]]
+-name = "rustls-pemfile"
+-version = "2.2.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+-dependencies = [
+- "rustls-pki-types",
+-]
+-
+ [[package]]
+ name = "rustls-pki-types"
+ version = "1.15.0"
+diff --git a/crates/ironrdp-server/Cargo.toml b/crates/ironrdp-server/Cargo.toml
+index ae73ff23..9493ae66 100644
+--- a/crates/ironrdp-server/Cargo.toml
++++ b/crates/ironrdp-server/Cargo.toml
+@@ -18,7 +18,7 @@ test = false
+ 
+ [features]
+ default = ["rayon", "qoi", "qoiz"]
+-helper = ["dep:x509-cert", "dep:rustls-pemfile"]
++helper = ["dep:x509-cert"]
+ rayon = ["dep:rayon"]
+ qoi = ["dep:qoicoubeh", "ironrdp-pdu/qoi"]
+ qoiz = ["dep:zstd-safe", "qoi", "ironrdp-pdu/qoiz"]
+@@ -65,7 +65,6 @@ ironrdp-rdpeudp = { path = "../ironrdp-rdpeudp", version = "0.1" } # public
+ ironrdp-rdpeudp-tokio = { path = "../ironrdp-rdpeudp-tokio", version = "0.1" } # public
+ tracing = { version = "0.1", features = ["log"] }
+ x509-cert = { version = "0.3", optional = true }
+-rustls-pemfile = { version = "2.2", optional = true }
+ rayon = { version = "1.12", optional = true }
+ bytes = "1"
+ visibility = { version = "0.1", optional = true }
+diff --git a/crates/ironrdp-server/src/helper.rs b/crates/ironrdp-server/src/helper.rs
+index d4b52b32..8bc40743 100644
+--- a/crates/ironrdp-server/src/helper.rs
++++ b/crates/ironrdp-server/src/helper.rs
+@@ -1,11 +1,10 @@
+ use std::fs::File;
+-use std::io::BufReader;
++use std::io;
+ use std::path::Path;
+ use std::sync::Arc;
+ 
+-use rustls_pemfile::{certs, pkcs8_private_keys};
+-use tokio_rustls::rustls::pki_types::pem::PemObject as _;
+-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
++use tokio_rustls::rustls::pki_types::pem::{self, PemObject as _};
++use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+ use tokio_rustls::{TlsAcceptor, rustls};
+ 
+ use crate::error::{ServerError, ServerErrorExt as _, ServerResult};
+@@ -19,7 +18,9 @@ pub struct TlsIdentityCtx {
+ impl TlsIdentityCtx {
+     /// A constructor to create a `TlsIdentityCtx` from the given certificate and key paths.
+     ///
+-    /// The file format can be either PEM (if the file extension ends with .pem) or DER.
++    /// Both files must contain PEM data. Key paths ending in `.pem` accept PKCS#1,
++    /// PKCS#8, or SEC1 keys; other key paths accept only PKCS#8 keys. The first
++    /// supported private key is used.
+     pub fn init_from_paths(cert_path: &Path, key_path: &Path) -> ServerResult<Self> {
+         let certs = if cert_path.extension().is_some_and(|ext| ext == "pem") {
+             CertificateDer::pem_file_iter(cert_path)
+@@ -27,23 +28,23 @@ impl TlsIdentityCtx {
+                 .collect::<Result<Vec<_>, _>>()
+                 .map_err(|e| ServerError::custom("collecting server cert", e))?
+         } else {
+-            certs(&mut BufReader::new(
++            CertificateDer::pem_reader_iter(
+                 File::open(cert_path).map_err(|e| ServerError::io("opening server cert", e))?,
+-            ))
++            )
+             .collect::<Result<Vec<_>, _>>()
+-            .map_err(|e| ServerError::io("collecting server cert", e))?
++            .map_err(|e| ServerError::io("collecting server cert", pem_error_to_io(e)))?
+         };
+ 
+         let priv_key = if key_path.extension().is_some_and(|ext| ext == "pem") {
+             PrivateKeyDer::from_pem_file(key_path).map_err(|e| ServerError::custom("reading server key", e))?
+         } else {
+-            pkcs8_private_keys(&mut BufReader::new(
++            PrivatePkcs8KeyDer::pem_reader_iter(
+                 File::open(key_path).map_err(|e| ServerError::io("opening server key", e))?,
+-            ))
++            )
+             .next()
+             .ok_or_else(|| ServerError::reason("server key", "no private key"))?
+             .map(PrivateKeyDer::from)
+-            .map_err(|e| ServerError::io("reading server key", e))?
++            .map_err(|e| ServerError::io("reading server key", pem_error_to_io(e)))?
+         };
+ 
+         let pub_key = {
+@@ -81,3 +82,10 @@ impl TlsIdentityCtx {
+         Ok(TlsAcceptor::from(Arc::new(server_config)))
+     }
+ }
++
++fn pem_error_to_io(error: pem::Error) -> io::Error {
++    match error {
++        pem::Error::Io(error) => error,
++        error => io::Error::new(io::ErrorKind::InvalidData, error),
++    }
++}
+diff --git a/crates/ironrdp-testsuite-extra/Cargo.toml b/crates/ironrdp-testsuite-extra/Cargo.toml
+index 3f5a3482..6064496e 100644
+--- a/crates/ironrdp-testsuite-extra/Cargo.toml
++++ b/crates/ironrdp-testsuite-extra/Cargo.toml
+@@ -50,12 +50,13 @@ ironrdp-rdpsnd-native = { path = "../ironrdp-rdpsnd-native", features = ["captur
+ ironrdp-rpc = { path = "../ironrdp-rpc", features = ["__test"] }
+ # The EGFX-over-UDP migration in ironrdp-server is behind its `egfx` feature,
+ # which nothing else in the workspace enables.
+-ironrdp-server = { path = "../ironrdp-server", features = ["egfx"] }
++ironrdp-server = { path = "../ironrdp-server", features = ["egfx", "helper"] }
+ ironrdp-viewer.path = "../ironrdp-viewer"
+ ironrdp-tokio.path = "../ironrdp-tokio"
+ ironrdp-tls = { path = "../ironrdp-tls", features = ["rustls"] }
+ ironrdp-vmconnect = { path = "../ironrdp-vmconnect", features = ["__test"] }
+ rcgen = "0.14"
++rstest.workspace = true
+ semver = "1.0"
+ tracing = { version = "0.1", features = ["log"] }
+ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+@@ -65,6 +66,7 @@ tokio = { version = "1", features = ["sync", "time", "net", "rt", "rt-multi-thre
+ # process default, which fails every TLS test in this binary.
+ tokio-rustls = { version = "0.26", default-features = false }
+ uuid = { version = "1", features = ["v4"] }
++x509-cert = "0.3"
+ 
+ [target.'cfg(windows)'.dev-dependencies]
+ ironrdp-rdpdr-native.path = "../ironrdp-rdpdr-native"
+diff --git a/crates/ironrdp-testsuite-extra/tests/main.rs b/crates/ironrdp-testsuite-extra/tests/main.rs
+index fb3fedf3..6f6046a9 100644
+--- a/crates/ironrdp-testsuite-extra/tests/main.rs
++++ b/crates/ironrdp-testsuite-extra/tests/main.rs
+@@ -9,5 +9,6 @@ mod dvc_pipe_proxy;
+ mod e2e;
+ mod gateway_detect;
+ mod rdpeudp_tokio;
++mod server_helper;
+ mod vmconnect;
+ mod volume;
+diff --git a/crates/ironrdp-testsuite-extra/tests/server_helper.rs b/crates/ironrdp-testsuite-extra/tests/server_helper.rs
+new file mode 100644
+index 00000000..760daccb
+--- /dev/null
++++ b/crates/ironrdp-testsuite-extra/tests/server_helper.rs
+@@ -0,0 +1,376 @@
++use core::time::Duration;
++use std::fs;
++use std::io;
++use std::path::PathBuf;
++use std::sync::Arc;
++
++use ironrdp_server::{ServerError, ServerErrorKind, ServerResult, TlsIdentityCtx};
++use rstest::rstest;
++use tokio_rustls::rustls::pki_types::PrivateKeyDer;
++use tokio_rustls::{TlsConnector, rustls};
++use x509_cert::der::asn1::BitString;
++use x509_cert::der::pem::{LineEnding, encode_string};
++use x509_cert::der::{Decode as _, Encode as _};
++
++struct IdentityFiles {
++    directory: PathBuf,
++    cert_path: PathBuf,
++    key_path: PathBuf,
++}
++
++impl IdentityFiles {
++    fn new(cert: &[u8], key: &[u8], cert_name: &str, key_name: &str) -> Self {
++        let directory = std::env::temp_dir().join(format!("ironrdp-server-helper-{}", uuid::Uuid::new_v4()));
++        fs::create_dir(&directory).expect("create temporary identity directory");
++        let files = Self {
++            cert_path: directory.join(cert_name),
++            key_path: directory.join(key_name),
++            directory,
++        };
++        fs::write(&files.cert_path, cert).expect("write temporary certificate");
++        fs::write(&files.key_path, key).expect("write temporary key");
++        files
++    }
++
++    fn load(&self) -> ServerResult<TlsIdentityCtx> {
++        TlsIdentityCtx::init_from_paths(&self.cert_path, &self.key_path)
++    }
++}
++
++impl Drop for IdentityFiles {
++    fn drop(&mut self) {
++        let _ = fs::remove_dir_all(&self.directory);
++    }
++}
++
++fn pem(label: &str, der: &[u8]) -> String {
++    encode_string(label, LineEnding::LF, der).expect("encode test PEM block")
++}
++
++fn assert_io_error(error: &ServerError, context: &str, kind: io::ErrorKind) {
++    assert!(matches!(error.kind(), ServerErrorKind::Io(source) if source.kind() == kind));
++    assert!(error.to_string().starts_with(&format!("[{context}]")));
++}
++
++#[rstest]
++#[case("server.crt", "server.key")]
++#[case("server.pem", "server-key.pem")]
++#[case("server.der", "server-key.der")]
++#[case("server.PEM", "server-key.PEM")]
++#[case("certificate", "key")]
++fn certificate_chain_and_nla_public_key_are_preserved(#[case] cert_name: &str, #[case] key_name: &str) {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let other = rcgen::generate_simple_self_signed(vec!["other.example".into()]).expect("generate other cert");
++    let chain = format!(
++        "preamble\n{}{}{}{}",
++        leaf.cert.pem(),
++        leaf.signing_key.serialize_pem(),
++        pem("IGNORED", &[1, 2, 3]),
++        other.cert.pem(),
++    )
++    .replace('\n', "\r\n");
++    let files = IdentityFiles::new(
++        chain.as_bytes(),
++        leaf.signing_key.serialize_pem().replace('\n', "\r\n").as_bytes(),
++        cert_name,
++        key_name,
++    );
++
++    let identity = files.load().expect("load PEM identity");
++    assert_eq!(identity.certs, vec![leaf.cert.der().clone(), other.cert.der().clone()]);
++    assert!(matches!(identity.priv_key, PrivateKeyDer::Pkcs8(_)));
++    assert!(identity.priv_key.secret_der() == leaf.signing_key.serialize_der());
++    // NLA binds to the subjectPublicKey BIT STRING contents, excluding the SPKI wrapper.
++    assert_eq!(identity.pub_key, leaf.signing_key.public_key_raw());
++    identity.make_acceptor().expect("matching certificate and key");
++}
++
++#[rstest]
++#[case(&rustls::version::TLS12)]
++#[case(&rustls::version::TLS13)]
++#[tokio::test]
++async fn legacy_identity_completes_a_verified_tls_handshake(
++    #[case] version: &'static rustls::SupportedProtocolVersion,
++) {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let files = IdentityFiles::new(
++        leaf.cert.pem().as_bytes(),
++        leaf.signing_key.serialize_pem().as_bytes(),
++        "server.crt",
++        "server.key",
++    );
++    let identity = files.load().expect("load legacy identity");
++    let acceptor = identity.make_acceptor().expect("make TLS acceptor");
++    let mut roots = rustls::RootCertStore::empty();
++    roots.add(leaf.cert.der().clone()).expect("trust test certificate");
++    let config = rustls::ClientConfig::builder_with_protocol_versions(&[version])
++        .with_root_certificates(roots)
++        .with_no_client_auth();
++    let connector = TlsConnector::from(Arc::new(config));
++    let (client, server) = tokio::io::duplex(16384);
++    let server_name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
++    let (server, client) = tokio::time::timeout(Duration::from_secs(5), async {
++        tokio::join!(acceptor.accept(server), connector.connect(server_name, client))
++    })
++    .await
++    .expect("TLS handshake completes");
++    let server = server.expect("server TLS handshake");
++    let client = client.expect("client verifies certificate and handshake");
++    assert_eq!(server.get_ref().1.protocol_version(), Some(version.version));
++    assert_eq!(
++        client.get_ref().1.peer_certificates().expect("server certificates"),
++        identity.certs
++    );
++    assert_eq!(identity.pub_key, leaf.signing_key.public_key_raw());
++}
++
++#[test]
++fn legacy_key_path_selects_first_pkcs8_without_reading_the_tail() {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let other = rcgen::KeyPair::generate().expect("generate other key");
++    let keys = format!(
++        "{}{}{}{}{}{}{}-----BEGIN PRIVATE KEY-----\ninvalid base64!\n",
++        pem("RSA PRIVATE KEY", &[1]),
++        pem("EC PRIVATE KEY", &[2]),
++        pem("ENCRYPTED PRIVATE KEY", &[3]),
++        leaf.cert.pem(),
++        leaf.signing_key.serialize_pem(),
++        pem("EC PRIVATE KEY", &[4]),
++        other.serialize_pem(),
++    );
++    let files = IdentityFiles::new(leaf.cert.pem().as_bytes(), keys.as_bytes(), "server.crt", "server.key");
++
++    let identity = files.load().expect("load first PKCS#8 key");
++    assert!(matches!(identity.priv_key, PrivateKeyDer::Pkcs8(_)));
++    assert!(identity.priv_key.secret_der() == leaf.signing_key.serialize_der());
++    identity.make_acceptor().expect("first key matches certificate");
++}
++
++#[rstest]
++#[case("server.key", false)]
++#[case("server.pem", false)]
++#[case("server.key", true)]
++#[case("server.pem", true)]
++fn invalid_first_private_key_does_not_fall_back_to_a_later_key(#[case] key_name: &str, #[case] invalid_der: bool) {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let wrong_key = rcgen::KeyPair::generate().expect("generate wrong key");
++    let first_der = if invalid_der {
++        vec![1, 2, 3]
++    } else {
++        wrong_key.serialize_der()
++    };
++    let keys = format!("{}{}", pem("PRIVATE KEY", &first_der), leaf.signing_key.serialize_pem());
++    let files = IdentityFiles::new(leaf.cert.pem().as_bytes(), keys.as_bytes(), "server.crt", key_name);
++
++    let identity = files.load().expect("load first key");
++    assert!(identity.priv_key.secret_der() == first_der);
++    let error = identity.make_acceptor().err().expect("reject invalid first key");
++    assert!(matches!(error.kind(), ServerErrorKind::Custom));
++    assert!(error.to_string().starts_with("[bad certificate/key]"));
++}
++
++#[rstest]
++#[case("RSA PRIVATE KEY")]
++#[case("EC PRIVATE KEY")]
++#[case("ENCRYPTED PRIVATE KEY")]
++#[case("CERTIFICATE")]
++fn legacy_key_path_rejects_files_without_a_pkcs8_block(#[case] label: &str) {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let files = IdentityFiles::new(
++        leaf.cert.pem().as_bytes(),
++        pem(label, &[1, 2, 3]).as_bytes(),
++        "server.crt",
++        "server.key",
++    );
++
++    let error = files.load().err().expect("require a PKCS#8 block");
++    assert!(matches!(error.kind(), ServerErrorKind::Reason(reason) if reason == "no private key"));
++}
++
++#[test]
++fn pem_key_path_rejects_encrypted_keys() {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let files = IdentityFiles::new(
++        leaf.cert.pem().as_bytes(),
++        pem("ENCRYPTED PRIVATE KEY", &[1, 2, 3]).as_bytes(),
++        "server.pem",
++        "server.key.pem",
++    );
++
++    let error = files.load().err().expect("encrypted key is unsupported");
++    assert!(matches!(error.kind(), ServerErrorKind::Custom));
++    assert!(error.to_string().starts_with("[reading server key]"));
++}
++
++#[rstest]
++#[case("RSA PRIVATE KEY")]
++#[case("EC PRIVATE KEY")]
++#[case("PRIVATE KEY")]
++fn pem_key_path_keeps_its_existing_format_selection_and_key_validation(#[case] label: &str) {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    // The PEM reader selects by label; rustls must still reject invalid DER when building the acceptor.
++    let keys = format!("{}{}", pem(label, &[1, 2, 3]), leaf.signing_key.serialize_pem());
++    let files = IdentityFiles::new(
++        leaf.cert.pem().as_bytes(),
++        keys.as_bytes(),
++        "server.pem",
++        "server.key.pem",
++    );
++
++    let identity = files.load().expect("select first recognized PEM key");
++    assert!(matches!(
++        (&identity.priv_key, label),
++        (PrivateKeyDer::Pkcs1(_), "RSA PRIVATE KEY")
++            | (PrivateKeyDer::Sec1(_), "EC PRIVATE KEY")
++            | (PrivateKeyDer::Pkcs8(_), "PRIVATE KEY")
++    ));
++    assert!(identity.priv_key.secret_der() == [1, 2, 3]);
++    let error = identity.make_acceptor().err().expect("reject invalid selected key");
++    assert!(matches!(error.kind(), ServerErrorKind::Custom));
++    assert!(error.to_string().starts_with("[bad certificate/key]"));
++}
++
++#[rstest]
++#[case("-----BEGIN PRIVATE KEY-----\n!\n-----END PRIVATE KEY-----\n")]
++#[case("-----BEGIN PRIVATE KEY-----\nAQID\n")]
++fn malformed_legacy_key_is_an_invalid_data_error(#[case] key: &str) {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let files = IdentityFiles::new(leaf.cert.pem().as_bytes(), key.as_bytes(), "server.crt", "server.key");
++
++    let error = files.load().err().expect("reject malformed key");
++    assert_io_error(&error, "reading server key", io::ErrorKind::InvalidData);
++}
++
++#[rstest]
++#[case("-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n")]
++#[case("-----BEGIN CERTIFICATE-----\nAQID\n")]
++fn malformed_legacy_certificate_tail_is_an_invalid_data_error(#[case] tail: &str) {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let certs = format!("{}{tail}", leaf.cert.pem());
++    let files = IdentityFiles::new(
++        certs.as_bytes(),
++        leaf.signing_key.serialize_pem().as_bytes(),
++        "server.crt",
++        "server.key",
++    );
++
++    let error = files.load().err().expect("reject malformed trailing certificate");
++    assert_io_error(&error, "collecting server cert", io::ErrorKind::InvalidData);
++}
++
++#[test]
++fn empty_or_der_inputs_are_not_accepted_as_legacy_pem() {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    for key in [Vec::new(), leaf.signing_key.serialize_der()] {
++        let files = IdentityFiles::new(leaf.cert.pem().as_bytes(), &key, "server.crt", "server.der");
++        let error = files.load().err().expect("reject key without a PEM block");
++        assert!(matches!(error.kind(), ServerErrorKind::Reason(reason) if reason == "no private key"));
++    }
++    for cert in [&[][..], leaf.cert.der().as_ref()] {
++        let files = IdentityFiles::new(
++            cert,
++            leaf.signing_key.serialize_pem().as_bytes(),
++            "server.der",
++            "server.key",
++        );
++        let error = files.load().err().expect("reject certificate without a PEM block");
++        assert!(matches!(error.kind(), ServerErrorKind::Reason(reason) if reason == "invalid cert"));
++    }
++}
++
++#[rstest]
++#[case(false)]
++#[case(true)]
++fn malformed_x509_and_trailing_der_are_rejected(#[case] trailing_der: bool) {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let der = if trailing_der {
++        let mut der = leaf.cert.der().to_vec();
++        der.push(0);
++        der
++    } else {
++        vec![0x30, 0]
++    };
++    let files = IdentityFiles::new(
++        pem("CERTIFICATE", &der).as_bytes(),
++        leaf.signing_key.serialize_pem().as_bytes(),
++        "server.crt",
++        "server.key",
++    );
++
++    let error = files.load().err().expect("strictly parse X.509 certificate");
++    assert!(matches!(error.kind(), ServerErrorKind::Custom));
++    assert!(error.to_string().starts_with("[parsing server cert]"));
++}
++
++#[test]
++fn unaligned_subject_public_key_is_rejected_before_nla_binding() {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let public_key = leaf.signing_key.public_key_raw();
++    let aligned = BitString::from_bytes(public_key)
++        .expect("aligned key")
++        .to_der()
++        .expect("DER bit string");
++    let mut unaligned_key = public_key.to_vec();
++    *unaligned_key.last_mut().expect("nonempty public key") &= 0xfe;
++    let unaligned = BitString::new(1, unaligned_key)
++        .expect("unaligned key")
++        .to_der()
++        .expect("DER bit string");
++    let mut der = leaf.cert.der().to_vec();
++    let offset = der
++        .windows(aligned.len())
++        .position(|bytes| bytes == aligned)
++        .expect("find subject public key");
++    der[offset..offset + aligned.len()].copy_from_slice(&unaligned);
++    // Keep this a valid DER/X.509 structure so the alignment check, not the parser, rejects it.
++    x509_cert::Certificate::from_der(&der).expect("structurally valid X.509 certificate");
++    let files = IdentityFiles::new(
++        pem("CERTIFICATE", &der).as_bytes(),
++        leaf.signing_key.serialize_pem().as_bytes(),
++        "server.crt",
++        "server.key",
++    );
++
++    let error = files.load().err().expect("require byte-aligned subject public key");
++    assert!(matches!(
++        error.kind(),
++        ServerErrorKind::Reason(reason) if reason == "subject public key BIT STRING is not aligned"
++    ));
++}
++
++#[test]
++fn missing_legacy_files_keep_io_error_kinds() {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let files = IdentityFiles::new(
++        leaf.cert.pem().as_bytes(),
++        leaf.signing_key.serialize_pem().as_bytes(),
++        "server.crt",
++        "server.key",
++    );
++    fs::remove_file(&files.key_path).expect("remove key");
++    let error = files.load().err().expect("key path is missing");
++    assert_io_error(&error, "opening server key", io::ErrorKind::NotFound);
++    fs::remove_file(&files.cert_path).expect("remove certificate");
++    let error = files.load().err().expect("certificate path is missing");
++    assert_io_error(&error, "opening server cert", io::ErrorKind::NotFound);
++}
++
++#[cfg(unix)]
++#[test]
++fn legacy_read_errors_keep_the_underlying_io_kind() {
++    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate leaf");
++    let files = IdentityFiles::new(
++        leaf.cert.pem().as_bytes(),
++        leaf.signing_key.serialize_pem().as_bytes(),
++        "server.crt",
++        "server.key",
++    );
++    fs::remove_file(&files.key_path).expect("remove key");
++    fs::create_dir(&files.key_path).expect("replace key with a directory");
++    let error = files.load().err().expect("cannot read a directory as a key");
++    assert_io_error(&error, "reading server key", io::ErrorKind::IsADirectory);
++    fs::remove_file(&files.cert_path).expect("remove certificate");
++    fs::create_dir(&files.cert_path).expect("replace certificate with a directory");
++    let error = files.load().err().expect("cannot read a directory as a certificate");
++    assert_io_error(&error, "collecting server cert", io::ErrorKind::IsADirectory);
++}

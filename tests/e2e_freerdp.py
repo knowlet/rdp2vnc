@@ -2,12 +2,14 @@
 """Loopback-only FreeRDP/NLA -> bridge -> independent RFB fixture test.
 
 Run under xvfb-run on Linux after cargo build --locked. Requires FreeRDP 3,
-xdotool, and Pillow. The throwaway password and /cert:ignore are ONLY for this
-isolated fixture, never production connection examples. No real desktop or
+xdotool, and Pillow; --legacy-identity also requires OpenSSL. The throwaway
+password and /cert:ignore are ONLY for this isolated fixture, never production
+connection examples. No real desktop or
 credentials are accessed. This is not a substitute for physical mstsc/macOS QA.
 """
 from __future__ import annotations
 
+import argparse
 import os
 from pathlib import Path
 import shutil
@@ -126,6 +128,10 @@ def stop(process: subprocess.Popen) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--legacy-identity", action="store_true",
+                        help="test an explicit .crt/.key identity with a throwaway PKCS#8 key")
+    args = parser.parse_args()
     client = shutil.which("xfreerdp3") or shutil.which("xfreerdp")
     assert client, "install freerdp3-x11"
     fixture = Fixture()
@@ -139,13 +145,31 @@ def main() -> None:
         env = dict(os.environ, XDG_DATA_HOME=str(root / "data"),
                    RDP2VNC_RDP_PASSWORD="fixture-only-good-password")
         gateway_log = root / "gateway.log"
+        identity_args: list[str] = []
+        identity_files: list[tuple[Path, bytes]] = []
         try:
+            if args.legacy_identity:
+                openssl = shutil.which("openssl")
+                assert openssl, "install openssl for --legacy-identity"
+                cert_path, key_path = root / "server.crt", root / "server.key"
+                subprocess.run([
+                    openssl, "req", "-x509", "-newkey", "ec",
+                    "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+                    "-subj", "/CN=localhost", "-days", "1",
+                    "-keyout", str(key_path), "-out", str(cert_path),
+                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30)
+                key_path.chmod(0o600)
+                key_bytes = key_path.read_bytes()
+                assert key_bytes.startswith(b"-----BEGIN PRIVATE KEY-----\n"), \
+                    "legacy fixture must use an unencrypted PKCS#8 PRIVATE KEY"
+                identity_files = [(cert_path, cert_path.read_bytes()), (key_path, key_bytes)]
+                identity_args = ["--cert", str(cert_path), "--key", str(key_path)]
             with gateway_log.open("w") as output:
                 gateway = subprocess.Popen([
                     "target/debug/rdp2vnc", f"127.0.0.1:{fixture.port}",
                     "--auth", "none", "--listen", f"127.0.0.1:{port}",
                     "--rdp-username", "ci", "--fps", "10",
-                ], env=env, stdout=output, stderr=subprocess.STDOUT)
+                ] + identity_args, env=env, stdout=output, stderr=subprocess.STDOUT)
             processes.append(gateway)
             until(lambda: "RDP ready" in gateway_log.read_text(), "gateway did not become ready")
             # A peer that never sends even X.224 must not reserve the desktop.
@@ -198,7 +222,10 @@ def main() -> None:
             assert gateway.returncode not in (0, 101), "backend disconnect should fail cleanly, not panic or succeed"
             assert "panicked at" not in gateway_log.read_text()
             assert not fixture.errors, fixture.errors
-            print("PASS: idle-peer admission; NLA rejection; authenticated pixels; keyboard/mouse; unsuccessful-peer input isolation; concurrent-client rejection; late-client snapshot; clean VNC EOF")
+            for path, original in identity_files:
+                assert path.read_bytes() == original, f"{path.name} changed during the test"
+            identity_mode = "legacy .crt/.key identity" if args.legacy_identity else "generated .pem identity"
+            print(f"PASS: {identity_mode}; idle-peer admission; NLA rejection; authenticated pixels; keyboard/mouse; unsuccessful-peer input isolation; concurrent-client rejection; late-client snapshot; clean VNC EOF")
         finally:
             if stalled is not None:
                 stalled.close()

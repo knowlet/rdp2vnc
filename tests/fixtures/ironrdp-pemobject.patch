@@ -1,0 +1,92 @@
+diff --git a/crates/ironrdp-server/Cargo.toml b/crates/ironrdp-server/Cargo.toml
+index ae73ff23..9493ae66 100644
+--- a/crates/ironrdp-server/Cargo.toml
++++ b/crates/ironrdp-server/Cargo.toml
+@@ -18,7 +18,7 @@ test = false
+ 
+ [features]
+ default = ["rayon", "qoi", "qoiz"]
+-helper = ["dep:x509-cert", "dep:rustls-pemfile"]
++helper = ["dep:x509-cert"]
+ rayon = ["dep:rayon"]
+ qoi = ["dep:qoicoubeh", "ironrdp-pdu/qoi"]
+ qoiz = ["dep:zstd-safe", "qoi", "ironrdp-pdu/qoiz"]
+@@ -65,7 +65,6 @@ ironrdp-rdpeudp = { path = "../ironrdp-rdpeudp", version = "0.1" } # public
+ ironrdp-rdpeudp-tokio = { path = "../ironrdp-rdpeudp-tokio", version = "0.1" } # public
+ tracing = { version = "0.1", features = ["log"] }
+ x509-cert = { version = "0.3", optional = true }
+-rustls-pemfile = { version = "2.2", optional = true }
+ rayon = { version = "1.12", optional = true }
+ bytes = "1"
+ visibility = { version = "0.1", optional = true }
+diff --git a/crates/ironrdp-server/src/helper.rs b/crates/ironrdp-server/src/helper.rs
+index d4b52b32..8bc40743 100644
+--- a/crates/ironrdp-server/src/helper.rs
++++ b/crates/ironrdp-server/src/helper.rs
+@@ -1,11 +1,10 @@
+ use std::fs::File;
+-use std::io::BufReader;
++use std::io;
+ use std::path::Path;
+ use std::sync::Arc;
+ 
+-use rustls_pemfile::{certs, pkcs8_private_keys};
+-use tokio_rustls::rustls::pki_types::pem::PemObject as _;
+-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
++use tokio_rustls::rustls::pki_types::pem::{self, PemObject as _};
++use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+ use tokio_rustls::{TlsAcceptor, rustls};
+ 
+ use crate::error::{ServerError, ServerErrorExt as _, ServerResult};
+@@ -19,7 +18,9 @@ pub struct TlsIdentityCtx {
+ impl TlsIdentityCtx {
+     /// A constructor to create a `TlsIdentityCtx` from the given certificate and key paths.
+     ///
+-    /// The file format can be either PEM (if the file extension ends with .pem) or DER.
++    /// Both files must contain PEM data. Key paths ending in `.pem` accept PKCS#1,
++    /// PKCS#8, or SEC1 keys; other key paths accept only PKCS#8 keys. The first
++    /// supported private key is used.
+     pub fn init_from_paths(cert_path: &Path, key_path: &Path) -> ServerResult<Self> {
+         let certs = if cert_path.extension().is_some_and(|ext| ext == "pem") {
+             CertificateDer::pem_file_iter(cert_path)
+@@ -27,23 +28,23 @@ impl TlsIdentityCtx {
+                 .collect::<Result<Vec<_>, _>>()
+                 .map_err(|e| ServerError::custom("collecting server cert", e))?
+         } else {
+-            certs(&mut BufReader::new(
++            CertificateDer::pem_reader_iter(
+                 File::open(cert_path).map_err(|e| ServerError::io("opening server cert", e))?,
+-            ))
++            )
+             .collect::<Result<Vec<_>, _>>()
+-            .map_err(|e| ServerError::io("collecting server cert", e))?
++            .map_err(|e| ServerError::io("collecting server cert", pem_error_to_io(e)))?
+         };
+ 
+         let priv_key = if key_path.extension().is_some_and(|ext| ext == "pem") {
+             PrivateKeyDer::from_pem_file(key_path).map_err(|e| ServerError::custom("reading server key", e))?
+         } else {
+-            pkcs8_private_keys(&mut BufReader::new(
++            PrivatePkcs8KeyDer::pem_reader_iter(
+                 File::open(key_path).map_err(|e| ServerError::io("opening server key", e))?,
+-            ))
++            )
+             .next()
+             .ok_or_else(|| ServerError::reason("server key", "no private key"))?
+             .map(PrivateKeyDer::from)
+-            .map_err(|e| ServerError::io("reading server key", e))?
++            .map_err(|e| ServerError::io("reading server key", pem_error_to_io(e)))?
+         };
+ 
+         let pub_key = {
+@@ -81,3 +82,10 @@ impl TlsIdentityCtx {
+         Ok(TlsAcceptor::from(Arc::new(server_config)))
+     }
+ }
++
++fn pem_error_to_io(error: pem::Error) -> io::Error {
++    match error {
++        pem::Error::Io(error) => error,
++        error => io::Error::new(io::ErrorKind::InvalidData, error),
++    }
++}

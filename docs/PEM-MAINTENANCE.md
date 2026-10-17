@@ -2,6 +2,35 @@
 
 This document records the bounded resolution of [#11](https://github.com/knowlet/rdp2vnc/issues/11) by [#12](https://github.com/knowlet/rdp2vnc/pull/12). Complete removal of the remaining transitive package is tracked independently in [#13](https://github.com/knowlet/rdp2vnc/issues/13).
 
+## Reproducible #13 candidate, pending integration
+
+This validation branch includes a focused upstream patch and an equivalent
+backport to the actual pinned IronRDP revision. See
+[patch provenance, validation and audit comparison](patches/README.md).
+The committed application manifest and lockfile still describe the original
+pin; the candidate workflow applies the production patch to an exact source
+checkout and uses a temporary path dependency only while running tests.
+
+Candidate lock validation confirms all 23 IronRDP packages are coherent and
+all 422 remaining registry entries are unchanged. The candidate lockfile
+contains 446 packages, with no `rustls-pemfile` entry or dependency edge.
+The current candidate audit no longer reports RUSTSEC-2025-0134, but retains
+five unrelated vulnerability records and four other warnings. It therefore
+still exits 1; the saved before/after reports do not claim a fully clean audit.
+
+The candidate CI graph check requires absence from the entire lockfile and
+all-platform metadata, then accepts only the specific absent-package result
+from the all-target reverse-dependency command. New platform-neutral tests
+call the identity loader directly to reject unsupported legacy key labels
+and preserve first-PKCS#8 selection. The Linux candidate workflow exercises
+both generated `.pem` and explicit `.crt/.key` identities through FreeRDP/NLA.
+
+Before closing #13, publish and review the upstream contribution, publish any
+required minimal backport at a full remote commit SHA, update the shipping
+dependency and lockfile, and repeat all integration gates on that final
+configuration. The original migration and residual-dependency record below
+continues to describe the committed baseline until then.
+
 ## Scope and source inspection
 
 The integration baseline is `536be2c1f986c3471cbbe294d85c132645368f84`. The application previously called `rustls_pemfile::certs` only in `src/rfb.rs` for the optional VeNCrypt CA bundle. That call now uses `CertificateDer::pem_reader_iter` and the `PemObject` trait through `tokio_rustls::rustls::pki_types`, an existing supported re-export. No new cryptographic dependency is introduced.
