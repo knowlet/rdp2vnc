@@ -1,6 +1,6 @@
 //! Legacy RFB authentication. These algorithms provide compatibility, NOT
 //! transport security. Callers must establish SSH/TLS or explicitly opt out.
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use anyhow::{Result, ensure};
 use md5::{Digest, Md5};
 use num_bigint::BigUint;
@@ -13,6 +13,8 @@ pub fn random_bytes(bytes: &mut [u8]) -> Result<()> {
 /// Classic VNC authentication uses an eight-byte, bit-reversed DES key.
 /// Reject longer/non-ASCII passwords instead of silently truncating them.
 pub fn vnc_response(password: &[u8], challenge: [u8; 16]) -> Result<[u8; 16]> {
+    use des::cipher::{BlockEncrypt, KeyInit};
+
     ensure!(
         password.len() <= 8 && password.is_ascii(),
         "classic VNC requires an ASCII password of at most 8 bytes; use ARD for a Mac account password"
@@ -24,7 +26,7 @@ pub fn vnc_response(password: &[u8], challenge: [u8; 16]) -> Result<[u8; 16]> {
     let cipher = des::Des::new_from_slice(key.as_ref())?;
     let mut result = challenge;
     for chunk in result.as_chunks_mut::<8>().0 {
-        cipher.encrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
+        cipher.encrypt_block(des::cipher::generic_array::GenericArray::from_mut_slice(
             chunk,
         ));
     }
@@ -92,9 +94,7 @@ pub fn ard_response(
     credentials[64..64 + password.len()].copy_from_slice(password.as_bytes());
     credentials[64 + password.len()] = 0;
     for block in credentials.as_chunks_mut::<16>().0 {
-        cipher.encrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
-            block,
-        ));
+        cipher.encrypt_block(aes::Block::cast_from_core_mut(block));
     }
     let mut response = credentials.to_vec();
     response.extend(padded(&public, modulus.len())?);
@@ -104,7 +104,7 @@ pub fn ard_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes::cipher::BlockDecrypt;
+    use aes::cipher::BlockCipherDecrypt;
 
     #[test]
     fn classic_vnc_known_des_vector() {
@@ -155,7 +155,7 @@ mod tests {
         let cipher = aes::Aes128::new_from_slice(&key).unwrap();
         let mut plain = response[..128].to_vec();
         for b in plain.as_chunks_mut::<16>().0 {
-            cipher.decrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(b));
+            cipher.decrypt_block(aes::Block::cast_from_core_mut(b));
         }
         assert_eq!(&plain[..7], b"albert\0");
         assert!(plain[64..].starts_with("密碼-password\0".as_bytes()));
