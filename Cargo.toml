@@ -14,7 +14,7 @@ aes = { version = "0.8", features = ["zeroize"] }
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
-des = { version = "0.8", features = ["zeroize"] }
+des = { version = "0.9", features = ["zeroize"] }
 directories = "6"
 flate2 = "1"
 getrandom = "0.4"
