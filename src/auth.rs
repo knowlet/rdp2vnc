@@ -13,6 +13,8 @@ pub fn random_bytes(bytes: &mut [u8]) -> Result<()> {
 /// Classic VNC authentication uses an eight-byte, bit-reversed DES key.
 /// Reject longer/non-ASCII passwords instead of silently truncating them.
 pub fn vnc_response(password: &[u8], challenge: [u8; 16]) -> Result<[u8; 16]> {
+    use des::cipher::{Block, BlockCipherEncrypt, KeyInit};
+
     ensure!(
         password.len() <= 8 && password.is_ascii(),
         "classic VNC requires an ASCII password of at most 8 bytes; use ARD for a Mac account password"
@@ -24,9 +26,7 @@ pub fn vnc_response(password: &[u8], challenge: [u8; 16]) -> Result<[u8; 16]> {
     let cipher = des::Des::new_from_slice(key.as_ref())?;
     let mut result = challenge;
     for chunk in result.as_chunks_mut::<8>().0 {
-        cipher.encrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
-            chunk,
-        ));
+        cipher.encrypt_block(Block::<des::Des>::cast_from_core_mut(chunk));
     }
     Ok(result)
 }
