@@ -1,6 +1,6 @@
 //! Legacy RFB authentication. These algorithms provide compatibility, NOT
 //! transport security. Callers must establish SSH/TLS or explicitly opt out.
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use anyhow::{Result, ensure};
 use md5::{Digest, Md5};
 use num_bigint::BigUint;
@@ -92,9 +92,7 @@ pub fn ard_response(
     credentials[64..64 + password.len()].copy_from_slice(password.as_bytes());
     credentials[64 + password.len()] = 0;
     for block in credentials.as_chunks_mut::<16>().0 {
-        cipher.encrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
-            block,
-        ));
+        cipher.encrypt_block(aes::Block::cast_from_core_mut(block));
     }
     let mut response = credentials.to_vec();
     response.extend(padded(&public, modulus.len())?);
@@ -104,7 +102,7 @@ pub fn ard_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes::cipher::BlockDecrypt;
+    use aes::cipher::BlockCipherDecrypt;
 
     #[test]
     fn classic_vnc_known_des_vector() {
@@ -155,7 +153,7 @@ mod tests {
         let cipher = aes::Aes128::new_from_slice(&key).unwrap();
         let mut plain = response[..128].to_vec();
         for b in plain.as_chunks_mut::<16>().0 {
-            cipher.decrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(b));
+            cipher.decrypt_block(aes::Block::cast_from_core_mut(b));
         }
         assert_eq!(&plain[..7], b"albert\0");
         assert!(plain[64..].starts_with("密碼-password\0".as_bytes()));
