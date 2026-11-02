@@ -10,7 +10,7 @@ repository = "https://github.com/knowlet/rdp2vnc"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-aes = { version = "0.8", features = ["zeroize"] }
+aes = { version = "0.9", features = ["zeroize"] }
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
