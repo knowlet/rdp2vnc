@@ -21,7 +21,7 @@ getrandom = "0.4"
 ironrdp-server = { git = "https://github.com/Devolutions/IronRDP", rev = "8e76c3168da578826d8fd707503655ea16bd3392", default-features = false, features = ["helper"] }
 md-5 = "0.11"
 num-bigint = "0.5"
-ratatui = "0.29"
+ratatui = "0.30"
 rcgen = "0.14"
 rpassword = "7"
 sha2 = "0.11.1"
