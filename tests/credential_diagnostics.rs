@@ -79,6 +79,8 @@ fn invalid_unicode_rdp_password_is_redacted() {
                 Err(error) => panic!("accepting fixture connection: {error}"),
             }
         };
+        // Accepted sockets inherit nonblocking mode on macOS and Windows.
+        wire.set_nonblocking(false).unwrap();
         wire.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         wire.set_write_timeout(Some(Duration::from_secs(5)))
             .unwrap();
