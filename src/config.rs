@@ -158,7 +158,9 @@ pub fn secret(env_name: &str, file: Option<&PathBuf>) -> Result<Option<Zeroizing
         match std::env::var(env_name) {
             Ok(value) => Some(Zeroizing::new(value)),
             Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(error).context("password environment variable is not UTF-8"),
+            // VarError::NotUnicode contains the rejected value. Do not attach
+            // it as a source error: main prints the complete error chain.
+            Err(_) => anyhow::bail!("password environment variable is not UTF-8"),
         }
     };
     value
