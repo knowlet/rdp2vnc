@@ -15,8 +15,6 @@ The program is an **RDP server and VNC client**. It does not start another deskt
 ```sh
 git clone https://github.com/knowlet/rdp2vnc.git
 cd rdp2vnc
-# Until the implementation PR is merged:
-git switch feat/rust-rdp-vnc-bridge
 cargo build --release --locked
 ```
 
